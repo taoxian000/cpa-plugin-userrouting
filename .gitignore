@@ -1,0 +1,7 @@
+_upstream/
+_tools/
+dist/
+*.dll
+*.dylib
+*.so
+*.h

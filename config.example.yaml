@@ -1,0 +1,45 @@
+# Copy this block into the main CLIProxyAPI config.yaml.
+api-keys:
+  - "apikey_1"
+  - "apikey_2"
+
+plugins:
+  enabled: true
+  dir: "plugins"
+  configs:
+    user-routing:
+      enabled: true
+      priority: 100
+
+      # A YAML object is recommended. A JSON object string is also accepted:
+      # prefix_map: '{"apikey_1":"prefix_1/","apikey_2":"prefix_2/","default":""}'
+      prefix_map:
+        apikey_1: "prefix_1/"
+        apikey_2: "prefix_2/"
+        default: ""
+
+      # Optional Codex quota-exhaustion fallback. By default, only
+      # usage_limit_reached responses switch models.
+      # The target list is attempted in order and is not recursive.
+      quota_fallback:
+        enabled: false
+        # When true, also retry another prefix for non-quota upstream errors.
+        # Streaming requests switch only before a response payload is sent.
+        fallback_on_other_errors: false
+        prefixes:
+          prefix_1:
+            - "prefix_2"
+            - "prefix_3"
+
+      # Usually empty: the plugin reads the same -config path used by CPA.
+      cpa_config_path: ""
+      strict_key_validation: true
+
+      # Usually empty: derived from CPA's host, port, and tls settings.
+      models_url: ""
+      model_cache_ttl: "5s"
+      model_lookup_timeout: "3s"
+      models_tls_insecure_skip_verify: false
+
+      # Guarantees that the CPA main log has a line containing the final model.
+      log_routing: true
