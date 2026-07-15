@@ -86,9 +86,9 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          asset="${PLUGIN_NAME}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.extension }}"
+          archive="${PLUGIN_NAME}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
 
       - name: Build shared library
         env:
@@ -102,17 +102,22 @@ jobs:
             -ldflags "-s -w -X main.pluginVersion=${{ steps.metadata.outputs.version }}" \
             -o "dist/build/${PLUGIN_NAME}.${{ matrix.extension }}" .
 
-      - name: Prepare release asset
+      - name: Package release asset
         run: |
           set -euo pipefail
           mkdir -p dist/release
-          cp "dist/build/${PLUGIN_NAME}.${{ matrix.extension }}" "dist/release/${{ steps.metadata.outputs.asset }}"
+          go run ./.github/scripts/package-release.go \
+            -library "dist/build/${PLUGIN_NAME}.${{ matrix.extension }}" \
+            -archive "dist/release/${{ steps.metadata.outputs.archive }}" \
+            -checksum "dist/release/${{ steps.metadata.outputs.archive }}.sha256"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.metadata.outputs.asset }}
-          path: dist/release/${{ steps.metadata.outputs.asset }}
+          name: ${{ steps.metadata.outputs.archive }}
+          path: |
+            dist/release/${{ steps.metadata.outputs.archive }}
+            dist/release/${{ steps.metadata.outputs.archive }}.sha256
           if-no-files-found: error
 
   build-cross:
@@ -147,9 +152,9 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          asset="${PLUGIN_NAME}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.extension }}"
+          archive="${PLUGIN_NAME}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
 
       - name: Build shared library
         timeout-minutes: 45
@@ -165,19 +170,24 @@ jobs:
           flags: -ldflags=-s -w
           x-flags: main.pluginVersion=${{ steps.metadata.outputs.version }}
 
-      - name: Prepare release asset
+      - name: Package release asset
         run: |
           set -euo pipefail
           library="dist/build/${{ matrix.goos }}-${{ matrix.goarch }}/${PLUGIN_NAME}.${{ matrix.extension }}"
           test -f "$library"
           mkdir -p dist/release
-          cp "$library" "dist/release/${{ steps.metadata.outputs.asset }}"
+          go run ./.github/scripts/package-release.go \
+            -library "$library" \
+            -archive "dist/release/${{ steps.metadata.outputs.archive }}" \
+            -checksum "dist/release/${{ steps.metadata.outputs.archive }}.sha256"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.metadata.outputs.asset }}
-          path: dist/release/${{ steps.metadata.outputs.asset }}
+          name: ${{ steps.metadata.outputs.archive }}
+          path: |
+            dist/release/${{ steps.metadata.outputs.archive }}
+            dist/release/${{ steps.metadata.outputs.archive }}.sha256
           if-no-files-found: error
 
   release:
@@ -196,10 +206,7 @@ jobs:
       - name: Create checksums
         run: |
           set -euo pipefail
-          (
-            cd dist/release
-            sha256sum user-routing_* > checksums.txt
-          )
+          sort dist/release/*.sha256 > dist/release/checksums.txt
 
       - name: Create or update release
         env:
@@ -207,9 +214,9 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/release/user-routing_* dist/release/checksums.txt --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "$GITHUB_REF_NAME" dist/release/*.zip dist/release/checksums.txt --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$GITHUB_REF_NAME" dist/release/user-routing_* dist/release/checksums.txt \
+            gh release create "$GITHUB_REF_NAME" dist/release/*.zip dist/release/checksums.txt \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --title "$GITHUB_REF_NAME" \
