@@ -30,7 +30,92 @@ jobs:
           CGO_ENABLED: "0"
         run: go test ./...
 
-  build:
+  build-native:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            extension: so
+            runner: ubuntu-24.04
+          - goos: linux
+            goarch: arm64
+            extension: so
+            runner: ubuntu-24.04-arm
+          - goos: darwin
+            goarch: amd64
+            extension: dylib
+            runner: macos-15-intel
+          - goos: darwin
+            goarch: arm64
+            extension: dylib
+            runner: macos-15
+          - goos: windows
+            goarch: amd64
+            extension: dll
+            runner: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up MinGW for Windows CGO
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+
+      - name: Resolve release metadata
+        id: metadata
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          asset="${PLUGIN_NAME}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.extension }}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Build shared library
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/build
+          go build -trimpath -buildmode=c-shared \
+            -ldflags "-s -w -X main.pluginVersion=${{ steps.metadata.outputs.version }}" \
+            -o "dist/build/${PLUGIN_NAME}.${{ matrix.extension }}" .
+
+      - name: Prepare release asset
+        run: |
+          set -euo pipefail
+          mkdir -p dist/release
+          cp "dist/build/${PLUGIN_NAME}.${{ matrix.extension }}" "dist/release/${{ steps.metadata.outputs.asset }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.metadata.outputs.asset }}
+          path: dist/release/${{ steps.metadata.outputs.asset }}
+          if-no-files-found: error
+
+  build-cross:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
     needs: test
     runs-on: ubuntu-24.04
@@ -39,23 +124,8 @@ jobs:
       matrix:
         include:
           - goos: windows
-            goarch: amd64
-            extension: dll
-          - goos: windows
             goarch: arm64
             extension: dll
-          - goos: linux
-            goarch: amd64
-            extension: so
-          - goos: linux
-            goarch: arm64
-            extension: so
-          - goos: darwin
-            goarch: amd64
-            extension: dylib
-          - goos: darwin
-            goarch: arm64
-            extension: dylib
           - goos: freebsd
             goarch: amd64
             extension: so
@@ -77,9 +147,9 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          archive="${PLUGIN_NAME}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
+          asset="${PLUGIN_NAME}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.extension }}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
 
       - name: Build shared library
         timeout-minutes: 45
@@ -90,35 +160,31 @@ jobs:
           dir: .
           packages: .
           targets: ${{ matrix.goos }}-${{ matrix.goarch }}
-          out-dir: dist/${{ matrix.goos }}-${{ matrix.goarch }}
+          out-dir: dist/build/${{ matrix.goos }}-${{ matrix.goarch }}
           output: ${{ env.PLUGIN_NAME }}.${{ matrix.extension }}
           flags: -ldflags=-s -w
           x-flags: main.pluginVersion=${{ steps.metadata.outputs.version }}
 
-      - name: Package release asset
+      - name: Prepare release asset
         run: |
           set -euo pipefail
-          library="dist/${{ matrix.goos }}-${{ matrix.goarch }}/${PLUGIN_NAME}.${{ matrix.extension }}"
+          library="dist/build/${{ matrix.goos }}-${{ matrix.goarch }}/${PLUGIN_NAME}.${{ matrix.extension }}"
           test -f "$library"
           mkdir -p dist/release
-          (
-            cd "$(dirname "$library")"
-            zip -9 "../../release/${{ steps.metadata.outputs.archive }}" "$(basename "$library")"
-          )
-          sha256sum "dist/release/${{ steps.metadata.outputs.archive }}" > "dist/release/${{ steps.metadata.outputs.archive }}.sha256"
+          cp "$library" "dist/release/${{ steps.metadata.outputs.asset }}"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.metadata.outputs.archive }}
-          path: |
-            dist/release/${{ steps.metadata.outputs.archive }}
-            dist/release/${{ steps.metadata.outputs.archive }}.sha256
+          name: ${{ steps.metadata.outputs.asset }}
+          path: dist/release/${{ steps.metadata.outputs.asset }}
           if-no-files-found: error
 
   release:
     name: Publish GitHub Release
-    needs: build
+    needs:
+      - build-native
+      - build-cross
     runs-on: ubuntu-24.04
     steps:
       - name: Download build artifacts
@@ -127,16 +193,23 @@ jobs:
           path: dist/release
           merge-multiple: true
 
+      - name: Create checksums
+        run: |
+          set -euo pipefail
+          (
+            cd dist/release
+            sha256sum user-routing_* > checksums.txt
+          )
+
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          sort dist/release/*.sha256 > dist/release/checksums.txt
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/release/*.zip dist/release/checksums.txt --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "$GITHUB_REF_NAME" dist/release/user-routing_* dist/release/checksums.txt --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$GITHUB_REF_NAME" dist/release/*.zip dist/release/checksums.txt \
+            gh release create "$GITHUB_REF_NAME" dist/release/user-routing_* dist/release/checksums.txt \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --title "$GITHUB_REF_NAME" \
