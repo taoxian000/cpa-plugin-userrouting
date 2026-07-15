@@ -81,6 +81,17 @@ Linux：
 
 将动态库复制到 CPA 的 `plugins.dir` 目录。插件 ID 由文件名决定，必须保持为 `user-routing`。
 
+### GitHub Release 构建
+
+推送匹配 `v*` 的 Git 标签会自动触发 GitHub Actions。工作流先运行测试，然后构建以下动态库：Windows、Linux、macOS 的 `amd64` 与 `arm64`，以及 FreeBSD `amd64`。
+
+每个目标平台会作为独立 ZIP 资产发布，ZIP 内只包含对应的 `user-routing` 动态库；Release 还包含每个 ZIP 的 `.sha256` 文件和汇总的 `checksums.txt`。例如，发布新版本：
+
+```bash
+git tag v0.2.3
+git push main v0.2.3
+```
+
 ## 配置
 
 完整示例见 [config.example.yaml](./config.example.yaml)。最小配置如下：

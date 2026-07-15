@@ -81,6 +81,17 @@ Build artifacts are placed in `dist/`:
 
 Copy the dynamic library to CPA's `plugins.dir` directory. The plugin ID is determined by the filename and must remain `user-routing`.
 
+### GitHub Release builds
+
+Pushing a Git tag that matches `v*` automatically triggers GitHub Actions. The workflow runs tests first, then builds shared libraries for Windows, Linux, and macOS on `amd64` and `arm64`, plus FreeBSD `amd64`.
+
+Each target is published as a separate ZIP asset containing only its corresponding `user-routing` shared library. The release also includes a `.sha256` file for every ZIP and an aggregated `checksums.txt`. For example, to publish a new version:
+
+```bash
+git tag v0.2.3
+git push main v0.2.3
+```
+
 ## Configuration
 
 See [config.example.yaml](./config.example.yaml) for a complete example. The minimum configuration is:
