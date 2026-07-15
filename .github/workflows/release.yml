@@ -1,0 +1,144 @@
+name: Build release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  PLUGIN_NAME: user-routing
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        env:
+          CGO_ENABLED: "0"
+        run: go test ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            extension: dll
+          - goos: windows
+            goarch: arm64
+            extension: dll
+          - goos: linux
+            goarch: amd64
+            extension: so
+          - goos: linux
+            goarch: arm64
+            extension: so
+          - goos: darwin
+            goarch: amd64
+            extension: dylib
+          - goos: darwin
+            goarch: arm64
+            extension: dylib
+          - goos: freebsd
+            goarch: amd64
+            extension: so
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve release metadata
+        id: metadata
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          archive="${PLUGIN_NAME}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
+      - name: Build shared library
+        timeout-minutes: 45
+        uses: go-cross/cgo-actions@v1
+        env:
+          GOFLAGS: -trimpath -buildmode=c-shared
+        with:
+          dir: .
+          packages: .
+          targets: ${{ matrix.goos }}-${{ matrix.goarch }}
+          out-dir: dist/${{ matrix.goos }}-${{ matrix.goarch }}
+          output: ${{ env.PLUGIN_NAME }}.${{ matrix.extension }}
+          flags: -ldflags=-s -w
+          x-flags: main.pluginVersion=${{ steps.metadata.outputs.version }}
+
+      - name: Package release asset
+        run: |
+          set -euo pipefail
+          library="dist/${{ matrix.goos }}-${{ matrix.goarch }}/${PLUGIN_NAME}.${{ matrix.extension }}"
+          test -f "$library"
+          mkdir -p dist/release
+          (
+            cd "$(dirname "$library")"
+            zip -9 "../../release/${{ steps.metadata.outputs.archive }}" "$(basename "$library")"
+          )
+          sha256sum "dist/release/${{ steps.metadata.outputs.archive }}" > "dist/release/${{ steps.metadata.outputs.archive }}.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.metadata.outputs.archive }}
+          path: |
+            dist/release/${{ steps.metadata.outputs.archive }}
+            dist/release/${{ steps.metadata.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/release
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sort dist/release/*.sha256 > dist/release/checksums.txt
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/release/*.zip dist/release/checksums.txt --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/release/*.zip dist/release/checksums.txt \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --notes "Automated release for $GITHUB_REF_NAME."
+          fi

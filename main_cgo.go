@@ -72,7 +72,8 @@ import (
 	"github.com/taoxian000/cpa-plugin-userrouting/internal/userrouting"
 )
 
-const pluginVersion = "0.2.0"
+// pluginVersion can be overridden by the release workflow with -ldflags -X.
+var pluginVersion = "0.2.0"
 
 type lifecycleRequest struct {
 	ConfigYAML []byte `json:"config_yaml"`
