@@ -16,14 +16,18 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-const PluginIdentifier = "user-routing"
+const (
+	PluginIdentifier             = "user-routing"
+	codexAlphaSearchSourceFormat = "codex-alpha-search"
+)
 
 var supportedFormats = map[string]struct{}{
-	"openai":          {},
-	"openai-response": {},
-	"claude":          {},
-	"gemini":          {},
-	"openai-video":    {},
+	"openai":                     {},
+	"openai-response":            {},
+	"claude":                     {},
+	"gemini":                     {},
+	"openai-video":               {},
+	codexAlphaSearchSourceFormat: {},
 }
 
 type HostCaller interface {
@@ -51,12 +55,13 @@ func NewRuntime(host HostCaller, rawConfig []byte, opts ConfigureOptions) (*Runt
 	}, nil
 }
 
-func (r *Runtime) Route(req pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, error) {
+func (r *Runtime) Route(req pluginapi.ModelRouteRequest, hostCallbackID string) (pluginapi.ModelRouteResponse, error) {
 	decline := pluginapi.ModelRouteResponse{Handled: false}
 	if r == nil || !r.config.Enabled {
 		return decline, nil
 	}
-	if _, ok := supportedFormats[strings.ToLower(strings.TrimSpace(req.SourceFormat))]; !ok {
+	sourceFormat := strings.ToLower(strings.TrimSpace(req.SourceFormat))
+	if _, ok := supportedFormats[sourceFormat]; !ok {
 		return decline, nil
 	}
 	if isCountTokensRequest(req.Metadata) {
@@ -85,6 +90,20 @@ func (r *Runtime) Route(req pluginapi.ModelRouteRequest) (pluginapi.ModelRouteRe
 	}
 	if hasSpecific && specificPrefix == "" && defaultPrefix == "" {
 		return decline, nil
+	}
+	if sourceFormat == codexAlphaSearchSourceFormat {
+		decision, errResolve := r.Resolve(context.Background(), req.Headers, req.Query, req.RequestedModel)
+		if errResolve != nil {
+			return decline, errResolve
+		}
+		r.logDecision(hostCallbackID, sourceFormat, decision, decision.FinalModel, false)
+		return pluginapi.ModelRouteResponse{
+			Handled:     true,
+			TargetKind:  pluginapi.ModelRouteTargetProvider,
+			Target:      "codex",
+			TargetModel: decision.FinalModel,
+			Reason:      "downstream_api_key_model_prefix",
+		}, nil
 	}
 	return pluginapi.ModelRouteResponse{
 		Handled:    true,

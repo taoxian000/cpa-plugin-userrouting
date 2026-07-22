@@ -48,10 +48,11 @@ quota_fallback:
 - Claude Messages (`claude`)
 - Gemini (`gemini`)
 - OpenAI Videos：`POST /v1/videos`、`/v1/videos/generations`、`/v1/videos/edits`、`/v1/videos/extensions`，以及 `/openai/v1/videos`（`openai-video`）
+- Codex Alpha Search：`POST /v1/alpha/search` 和 `/backend-api/codex/alpha/search`（`codex-alpha-search`，需要 CLIProxyAPI v7.2.95 或更高版本）
 
-视频请求与消息请求使用同一套 API Key 前缀、模型目录校验、日志与额度回退逻辑。Claude `/v1/messages/count_tokens` 不经过插件，因为当前 CLIProxyAPI 插件 ABI 没有“通过主程序执行 token count”的回调；该接口保留 CPA 原生行为。
+视频请求与消息请求使用同一套 API Key 前缀、模型目录校验、日志与额度回退逻辑。Alpha Search 在模型路由阶段解析前缀，并让 CPA 使用最终模型选择 Codex 账户；发送至 Codex 的请求体仍保留无前缀模型。Alpha Search 不经过插件执行器，因此不支持 `quota_fallback`。Claude `/v1/messages/count_tokens` 不经过插件，因为当前 CLIProxyAPI 插件 ABI 没有“通过主程序执行 token count”的回调；该接口保留 CPA 原生行为。
 
-图像和在线搜索端点当前不能由本插件安全路由，原因均在 CPA 主程序：图像端点的插件执行器回调没有传递“允许图像模型”标记，因此 CPA 会拒绝 `gpt-image-*`、`grok-imagine-image*` 等图像专用模型；`POST /v1/alpha/search` 和 `POST /backend-api/codex/alpha/search` 则会直接选择 Codex 鉴权并发起上游 HTTP 请求，未调用插件的模型路由器或执行器。两类功能都需要 CPA 主程序增加对应的插件回调；仅更新本动态插件无法实现。
+图像端点当前仍不能由本插件安全路由：图像端点的插件执行器回调没有传递“允许图像模型”标记，因此 CPA 会拒绝 `gpt-image-*`、`grok-imagine-image*` 等图像专用模型。该功能需要 CPA 主程序增加对应的插件回调。
 
 ## 构建
 

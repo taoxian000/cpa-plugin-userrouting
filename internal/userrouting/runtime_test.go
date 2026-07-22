@@ -63,7 +63,7 @@ func TestRouteDeclinesCountTokensAndUnchangedDefault(t *testing.T) {
 		RequestedModel: "claude-sonnet-4-5",
 		Headers:        bearerHeader("key-1"),
 	}
-	response, err := runtime.Route(base)
+	response, err := runtime.Route(base, "")
 	if err != nil {
 		t.Fatalf("Route() error = %v", err)
 	}
@@ -71,7 +71,7 @@ func TestRouteDeclinesCountTokensAndUnchangedDefault(t *testing.T) {
 		t.Fatal("Route() handled unchanged default request")
 	}
 	base.Metadata = map[string]any{"request_path": "/v1/messages/count_tokens"}
-	response, err = runtime.Route(base)
+	response, err = runtime.Route(base, "")
 	if err != nil {
 		t.Fatalf("Route(count) error = %v", err)
 	}
@@ -90,12 +90,59 @@ func TestRouteHandlesVideoFormat(t *testing.T) {
 		SourceFormat:   "openai-video",
 		RequestedModel: "grok-imagine-video",
 		Headers:        bearerHeader("key-1"),
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("Route() error = %v", err)
 	}
 	if !response.Handled || response.TargetKind != pluginapi.ModelRouteTargetSelf {
 		t.Fatalf("Route() response = %#v", response)
+	}
+}
+
+func TestRouteCodexAlphaSearchTargetsProviderWithResolvedModel(t *testing.T) {
+	runtime, catalogRequests := testRuntime(t, []string{"team-a/gpt-5", "fallback/gpt-5"})
+	response, err := runtime.Route(pluginapi.ModelRouteRequest{
+		SourceFormat:   codexAlphaSearchSourceFormat,
+		RequestedModel: "gpt-5",
+		Headers:        bearerHeader("key-1"),
+	}, "callback-1")
+	if err != nil {
+		t.Fatalf("Route() error = %v", err)
+	}
+	if !response.Handled || response.TargetKind != pluginapi.ModelRouteTargetProvider || response.Target != "codex" {
+		t.Fatalf("Route() response = %#v", response)
+	}
+	if response.TargetModel != "team-a/gpt-5" {
+		t.Fatalf("TargetModel = %q, want %q", response.TargetModel, "team-a/gpt-5")
+	}
+	if *catalogRequests != 1 {
+		t.Fatalf("catalog requests = %d, want 1", *catalogRequests)
+	}
+
+	logCall := runtime.host.(*fakeHost).call(pluginabi.MethodHostLog)
+	if got := gjson.GetBytes(logCall, "host_callback_id").String(); got != "callback-1" {
+		t.Fatalf("log host callback ID = %q", got)
+	}
+	if got := gjson.GetBytes(logCall, "fields.model").String(); got != "team-a/gpt-5" {
+		t.Fatalf("logged model = %q", got)
+	}
+}
+
+func TestRouteCodexAlphaSearchUsesDefaultPrefixWhenSpecificModelIsUnavailable(t *testing.T) {
+	runtime, _ := testRuntime(t, []string{"fallback/gpt-5"})
+	response, err := runtime.Route(pluginapi.ModelRouteRequest{
+		SourceFormat:   codexAlphaSearchSourceFormat,
+		RequestedModel: "gpt-5",
+		Headers:        bearerHeader("key-1"),
+	}, "")
+	if err != nil {
+		t.Fatalf("Route() error = %v", err)
+	}
+	if !response.Handled || response.TargetKind != pluginapi.ModelRouteTargetProvider || response.Target != "codex" {
+		t.Fatalf("Route() response = %#v", response)
+	}
+	if response.TargetModel != "fallback/gpt-5" {
+		t.Fatalf("TargetModel = %q, want %q", response.TargetModel, "fallback/gpt-5")
 	}
 }
 
