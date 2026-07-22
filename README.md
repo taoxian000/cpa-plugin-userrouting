@@ -41,14 +41,17 @@ quota_fallback:
 
 该列表只执行一层、按给定顺序尝试。默认只有 `usage_limit_reached` 会触发切换；将 `fallback_on_other_errors` 设为 `true` 后，其他上游错误也会触发切换。已经向客户端输出内容的流式请求不会切换。每次切换都会由 CPA 主日志记录为 `quota_fallback=true`。
 
-支持的消息协议：
+支持的 API/协议：
 
 - OpenAI Chat Completions (`openai`)
 - OpenAI Responses (`openai-response`)
 - Claude Messages (`claude`)
 - Gemini (`gemini`)
+- OpenAI Videos：`POST /v1/videos`、`/v1/videos/generations`、`/v1/videos/edits`、`/v1/videos/extensions`，以及 `/openai/v1/videos`（`openai-video`）
 
-Claude `/v1/messages/count_tokens` 不经过插件，因为当前 CLIProxyAPI 插件 ABI 没有“通过主程序执行 token count”的回调；该接口保留 CPA 原生行为。普通消息请求、非流式请求和流式请求均受支持。
+视频请求与消息请求使用同一套 API Key 前缀、模型目录校验、日志与额度回退逻辑。Claude `/v1/messages/count_tokens` 不经过插件，因为当前 CLIProxyAPI 插件 ABI 没有“通过主程序执行 token count”的回调；该接口保留 CPA 原生行为。
+
+图像和在线搜索端点当前不能由本插件安全路由，原因均在 CPA 主程序：图像端点的插件执行器回调没有传递“允许图像模型”标记，因此 CPA 会拒绝 `gpt-image-*`、`grok-imagine-image*` 等图像专用模型；`POST /v1/alpha/search` 和 `POST /backend-api/codex/alpha/search` 则会直接选择 Codex 鉴权并发起上游 HTTP 请求，未调用插件的模型路由器或执行器。两类功能都需要 CPA 主程序增加对应的插件回调；仅更新本动态插件无法实现。
 
 ## 构建
 

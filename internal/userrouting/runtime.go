@@ -23,6 +23,7 @@ var supportedFormats = map[string]struct{}{
 	"openai-response": {},
 	"claude":          {},
 	"gemini":          {},
+	"openai-video":    {},
 }
 
 type HostCaller interface {

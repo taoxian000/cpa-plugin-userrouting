@@ -274,7 +274,7 @@ func loadedRuntime() (*userrouting.Runtime, error) {
 }
 
 func pluginRegistration() registration {
-	formats := []string{"openai", "openai-response", "claude", "gemini"}
+	formats := []string{"openai", "openai-response", "claude", "gemini", "openai-video"}
 	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{

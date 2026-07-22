@@ -5,3 +5,4 @@ dist/
 *.dylib
 *.so
 *.h
+AGENTS.md

@@ -41,14 +41,17 @@ quota_fallback:
 
 The list is applied for one level only and in the specified order. By default, only `usage_limit_reached` triggers a switch. Set `fallback_on_other_errors` to `true` to also switch on other upstream errors. A streaming request that has already emitted content never switches models. Every switch is recorded in the CPA main log with `quota_fallback=true`.
 
-Supported request protocols:
+Supported APIs/protocols:
 
 - OpenAI Chat Completions (`openai`)
 - OpenAI Responses (`openai-response`)
 - Claude Messages (`claude`)
 - Gemini (`gemini`)
+- OpenAI Videos: `POST /v1/videos`, `/v1/videos/generations`, `/v1/videos/edits`, `/v1/videos/extensions`, and `/openai/v1/videos` (`openai-video`)
 
-Claude's `/v1/messages/count_tokens` does not pass through the plugin because the current CLIProxyAPI plugin ABI has no callback for performing token counting through the host. That endpoint retains CPA's native behavior. Standard message requests, non-streaming requests, and streaming requests are supported.
+Video requests use the same API-key prefix map, model-catalog validation, logging, and quota-fallback behavior as message requests. Claude's `/v1/messages/count_tokens` does not pass through the plugin because the current CLIProxyAPI plugin ABI has no callback for performing token counting through the host. That endpoint retains CPA's native behavior.
+
+Image and online-search endpoints cannot currently be routed safely by this plugin because of CPA core limitations. The plugin-executor callback for image endpoints does not carry an "allow image model" flag, so CPA rejects image-only models such as `gpt-image-*` and `grok-imagine-image*`. `POST /v1/alpha/search` and `POST /backend-api/codex/alpha/search` select Codex authentication and send the upstream HTTP request directly, without calling the plugin model router or executor. Both capabilities require corresponding CPA core callbacks; updating this dynamic plugin alone cannot provide them.
 
 ## Build
 

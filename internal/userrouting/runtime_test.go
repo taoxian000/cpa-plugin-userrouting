@@ -80,6 +80,25 @@ func TestRouteDeclinesCountTokensAndUnchangedDefault(t *testing.T) {
 	}
 }
 
+func TestRouteHandlesVideoFormat(t *testing.T) {
+	path := writeCPAConfig(t, "key-1")
+	runtime, err := NewRuntime(&fakeHost{}, []byte("cpa_config_path: "+quotedYAML(path)+"\nprefix_map:\n  key-1: team-a\n  default: fallback\n"), ConfigureOptions{})
+	if err != nil {
+		t.Fatalf("NewRuntime() error = %v", err)
+	}
+	response, err := runtime.Route(pluginapi.ModelRouteRequest{
+		SourceFormat:   "openai-video",
+		RequestedModel: "grok-imagine-video",
+		Headers:        bearerHeader("key-1"),
+	})
+	if err != nil {
+		t.Fatalf("Route() error = %v", err)
+	}
+	if !response.Handled || response.TargetKind != pluginapi.ModelRouteTargetSelf {
+		t.Fatalf("Route() response = %#v", response)
+	}
+}
+
 func TestExecuteForwardsRewrittenModelAndLogsIt(t *testing.T) {
 	runtime, _ := testRuntime(t, []string{"team-a/gpt-5"})
 	response, err := runtime.Execute(context.Background(), pluginapi.ExecutorRequest{
