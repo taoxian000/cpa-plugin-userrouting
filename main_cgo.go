@@ -195,7 +195,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err := json.Unmarshal(request, &req); err != nil {
 			return errorEnvelopeFor(err), nil
 		}
-		response, err := runtime.Route(req.ModelRouteRequest)
+		response, err := runtime.Route(req.ModelRouteRequest, req.HostCallbackID)
 		if err != nil {
 			return errorEnvelopeFor(err), nil
 		}

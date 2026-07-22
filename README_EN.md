@@ -48,10 +48,11 @@ Supported APIs/protocols:
 - Claude Messages (`claude`)
 - Gemini (`gemini`)
 - OpenAI Videos: `POST /v1/videos`, `/v1/videos/generations`, `/v1/videos/edits`, `/v1/videos/extensions`, and `/openai/v1/videos` (`openai-video`)
+- Codex Alpha Search: `POST /v1/alpha/search` and `/backend-api/codex/alpha/search` (`codex-alpha-search`, requires CLIProxyAPI v7.2.95 or later)
 
-Video requests use the same API-key prefix map, model-catalog validation, logging, and quota-fallback behavior as message requests. Claude's `/v1/messages/count_tokens` does not pass through the plugin because the current CLIProxyAPI plugin ABI has no callback for performing token counting through the host. That endpoint retains CPA's native behavior.
+Video requests use the same API-key prefix map, model-catalog validation, logging, and quota-fallback behavior as message requests. Alpha Search resolves the prefix during model routing and asks CPA to select the Codex account with the final model; the request body sent to Codex keeps the unprefixed model. Alpha Search does not pass through the plugin executor, so `quota_fallback` is unavailable for this endpoint. Claude's `/v1/messages/count_tokens` does not pass through the plugin because the current CLIProxyAPI plugin ABI has no callback for performing token counting through the host. That endpoint retains CPA's native behavior.
 
-Image and online-search endpoints cannot currently be routed safely by this plugin because of CPA core limitations. The plugin-executor callback for image endpoints does not carry an "allow image model" flag, so CPA rejects image-only models such as `gpt-image-*` and `grok-imagine-image*`. `POST /v1/alpha/search` and `POST /backend-api/codex/alpha/search` select Codex authentication and send the upstream HTTP request directly, without calling the plugin model router or executor. Both capabilities require corresponding CPA core callbacks; updating this dynamic plugin alone cannot provide them.
+Image endpoints still cannot be routed safely by this plugin. The plugin-executor callback for image endpoints does not carry an "allow image model" flag, so CPA rejects image-only models such as `gpt-image-*` and `grok-imagine-image*`. This capability requires a corresponding CPA core callback.
 
 ## Build
 
