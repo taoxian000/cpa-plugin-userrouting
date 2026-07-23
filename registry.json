@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "user-routing",
+      "name": "CPA User Routing",
+      "description": "Routes CLIProxyAPI requests by authenticated downstream API key, resolves per-key model prefixes with catalog validation, and supports ordered Codex quota fallback.",
+      "author": "taoxian000",
+      "repository": "https://github.com/taoxian000/cpa-plugin-userrouting",
+      "homepage": "https://github.com/taoxian000/cpa-plugin-userrouting",
+      "license": "MIT",
+      "tags": ["model-router","codex"]
+    }
+  ]
+}
