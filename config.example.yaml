@@ -18,6 +18,12 @@ plugins:
         apikey_2: "prefix_2/"
         default: ""
 
+      # Register additional deduplicated unprefixed models. This is additive;
+      # CPA's original prefixed models remain visible.
+      register_deduplicated_models: false
+      # Include prefix_map.default when building the deduplication prefix list.
+      include_default_prefix: true
+
       # Optional Codex quota-exhaustion fallback. By default, only
       # usage_limit_reached responses switch models.
       # The target list is attempted in order and is not recursive.
@@ -30,6 +36,14 @@ plugins:
           prefix_1:
             - "prefix_2"
             - "prefix_3"
+
+      # Register the Codex QuotaProvider and expose a public resource endpoint.
+      # The endpoint still requires a valid downstream CPA API key, but not the
+      # CPA Management Key. Set public_endpoint to false to keep only CPA's
+      # native Management API integration.
+      quota_provider:
+        enabled: true
+        public_endpoint: true
 
       # Usually empty: the plugin reads the same -config path used by CPA.
       cpa_config_path: ""

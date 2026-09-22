@@ -22,6 +22,10 @@ When a request uses model `gpt-5`:
 
 The plugin never writes API keys to its logs. The model catalog is cached for five seconds by default.
 
+### Deduplicated model registration
+
+Disabled by default. When `register_deduplicated_models` is enabled, the plugin uses CPA's model registration capability to add deduplicated, unprefixed model names; CPA's original prefixed models remain visible. `include_default_prefix` is enabled by default and includes a non-empty `default` prefix; disabling it limits stripping to API-key prefixes. This capability requires CPA v7.2.155 or later.
+
 Known issue: this plugin currently cannot be enabled together with [cpa-plugin-codexcomp](https://github.com/uf-hy/cpa-plugin-codexcomp). Otherwise, Codex WebSocket requests may return 408 because the response stream does not receive `response.completed`.
 
 ### Codex cross-prefix quota fallback
@@ -40,6 +44,25 @@ quota_fallback:
 ```
 
 The list is applied for one level only and in the specified order. By default, only `usage_limit_reached` triggers a switch. Set `fallback_on_other_errors` to `true` to also switch on other upstream errors. A streaming request that has already emitted content never switches models. Every switch is recorded in the CPA main log with `quota_fallback=true`.
+
+### Codex quota queries
+
+The plugin implements CPA's `QuotaProvider` capability for Codex. This requires CPA v7.3.9 or later, which includes the `QuotaProvider` ABI. It also registers a public resource endpoint that does not require the CPA Management Key, but does require a valid downstream CPA API key:
+
+```text
+GET /v0/resource/plugins/user-routing/quota
+Authorization: Bearer <CPA downstream API key>
+```
+
+The request key selects the nominal prefix from `prefix_map`. The plugin then queries Codex credentials for that prefix and the ordered successors in `quota_fallback.prefixes`. The response's `nominal_prefix` is the prefix from the key-to-prefix map, while each `prefixes[].actual_prefix` is the prefix actually queried after quota fallback expansion. The top-level `actual_prefix` is the first candidate that still has remaining quota. Credential indexes, email addresses, tokens, and raw auth JSON are never returned.
+
+```yaml
+quota_provider:
+  enabled: true
+  public_endpoint: true
+```
+
+With `public_endpoint: false`, CPA's native `QuotaProvider` integration remains available, but the public resource route is not registered. Codex quota is read from ChatGPT/Codex's `/backend-api/wham/usage` endpoint; this is a private upstream endpoint and changes to its response format may make quota queries fail.
 
 Supported APIs/protocols:
 
@@ -132,9 +155,13 @@ Non-empty prefixes are normalized to end with `/`, so `prefix_1` and `prefix_1/`
 | `enabled` | `true` | Whether to enable the plugin. |
 | `cpa_config_path` | Auto-discovered | CPA's `-config` argument is used first, then `CPA_CONFIG_PATH`, then `./config.yaml`. |
 | `prefix_map` | `{"default":""}` | Mapping from native API keys to prefixes; `default` is the fallback prefix. |
+| `register_deduplicated_models` | `false` | Register additional unprefixed, deduplicated models in CPA. |
+| `include_default_prefix` | `true` | Include a non-empty `default` prefix in the deduplication prefix list. |
 | `quota_fallback.enabled` | `false` | Enable cross-prefix model fallback when a Codex account returns `usage_limit_reached`. |
 | `quota_fallback.fallback_on_other_errors` | `false` | Also perform cross-prefix fallback for other upstream errors; streaming requests only fall back before their first emitted payload. |
 | `quota_fallback.prefixes` | Empty | Mapping from source prefixes to target prefixes to attempt in order. |
+| `quota_provider.enabled` | `true` | Register the Codex `QuotaProvider`. |
+| `quota_provider.public_endpoint` | `true` | Register the quota resource route without the Management Key while requiring a downstream API key. |
 | `strict_key_validation` | `true` | Reject configuration when a mapped key does not exist in CPA's `api-keys`. |
 | `models_url` | Auto-derived | Absolute URL of CPA's `/v1/models` endpoint. |
 | `model_cache_ttl` | `5s` | Model catalog cache lifetime; `0s` disables caching. |

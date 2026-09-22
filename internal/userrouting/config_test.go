@@ -61,6 +61,52 @@ func TestResolveCPAConfigPathUsesCPAArgument(t *testing.T) {
 	}
 }
 
+func TestModelRegistrationConfigDefaultsAndOverrides(t *testing.T) {
+	path := writeCPAConfig(t, "key-1")
+	defaultConfig, err := decodeRuntimeConfig([]byte("cpa_config_path: "+quotedYAML(path)), ConfigureOptions{})
+	if err != nil {
+		t.Fatalf("decode default config: %v", err)
+	}
+	if defaultConfig.RegisterDeduplicatedModels {
+		t.Fatal("register_deduplicated_models default = true, want false")
+	}
+	if !defaultConfig.IncludeDefaultPrefix {
+		t.Fatal("include_default_prefix default = false, want true")
+	}
+
+	override := []byte("cpa_config_path: " + quotedYAML(path) + "\n" +
+		"register_deduplicated_models: true\n" +
+		"include_default_prefix: false\n")
+	configured, err := decodeRuntimeConfig(override, ConfigureOptions{})
+	if err != nil {
+		t.Fatalf("decode overridden config: %v", err)
+	}
+	if !configured.RegisterDeduplicatedModels || configured.IncludeDefaultPrefix {
+		t.Fatalf("model registration config = (%v, %v), want (true, false)", configured.RegisterDeduplicatedModels, configured.IncludeDefaultPrefix)
+	}
+}
+
+func TestQuotaProviderConfigDefaultsAndOverrides(t *testing.T) {
+	path := writeCPAConfig(t, "key-1")
+	defaultConfig, err := decodeRuntimeConfig([]byte("cpa_config_path: "+quotedYAML(path)), ConfigureOptions{})
+	if err != nil {
+		t.Fatalf("decode default config: %v", err)
+	}
+	if !defaultConfig.QuotaProvider.Enabled || !defaultConfig.QuotaProvider.PublicEndpoint {
+		t.Fatalf("quota provider defaults = %#v, want both enabled", defaultConfig.QuotaProvider)
+	}
+
+	override := []byte("cpa_config_path: " + quotedYAML(path) + "\n" +
+		"quota_provider:\n  enabled: false\n  public_endpoint: false\n")
+	configured, err := decodeRuntimeConfig(override, ConfigureOptions{})
+	if err != nil {
+		t.Fatalf("decode overridden config: %v", err)
+	}
+	if configured.QuotaProvider.Enabled || configured.QuotaProvider.PublicEndpoint {
+		t.Fatalf("quota provider override = %#v, want both disabled", configured.QuotaProvider)
+	}
+}
+
 func writeCPAConfig(t *testing.T, keys ...string) string {
 	t.Helper()
 	dir := t.TempDir()

@@ -90,6 +90,21 @@ type rpcExecutorRequest struct {
 	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
+type rpcManagementRequest struct {
+	pluginapi.ManagementRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type rpcQuotaFetchRequest struct {
+	pluginapi.QuotaFetchRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type rpcQuotaResetRequest struct {
+	pluginapi.QuotaResetRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
 type registration struct {
 	SchemaVersion uint32                 `json:"schema_version"`
 	Metadata      pluginapi.Metadata     `json:"metadata"`
@@ -97,8 +112,11 @@ type registration struct {
 }
 
 type registrationCapability struct {
+	ModelRegistrar        bool     `json:"model_registrar"`
 	ModelRouter           bool     `json:"model_router"`
 	Executor              bool     `json:"executor"`
+	ManagementAPI         bool     `json:"management_api"`
+	QuotaProvider         bool     `json:"quota_provider"`
 	ExecutorModelScope    string   `json:"executor_model_scope"`
 	ExecutorInputFormats  []string `json:"executor_input_formats"`
 	ExecutorOutputFormats []string `json:"executor_output_formats"`
@@ -185,7 +203,17 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, err
 		}
 		currentRuntime.Store(runtime)
-		return okEnvelope(pluginRegistration())
+		return okEnvelope(pluginRegistration(runtime))
+	case pluginabi.MethodModelRegister:
+		runtime, err := loadedRuntime()
+		if err != nil {
+			return errorEnvelopeFor(err), nil
+		}
+		response, err := runtime.RegisterModels(context.Background())
+		if err != nil {
+			return errorEnvelopeFor(err), nil
+		}
+		return okEnvelope(response)
 	case pluginabi.MethodModelRoute:
 		runtime, err := loadedRuntime()
 		if err != nil {
@@ -222,6 +250,58 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return errorEnvelope("unsupported_count_tokens", "user-routing leaves count_tokens requests on CPA's native path", http.StatusNotImplemented), nil
 	case pluginabi.MethodExecutorHTTPRequest:
 		return errorEnvelope("unsupported_http_request", "user-routing does not implement executor.http_request", http.StatusNotImplemented), nil
+	case pluginabi.MethodManagementRegister:
+		runtime, err := loadedRuntime()
+		if err != nil {
+			return errorEnvelopeFor(err), nil
+		}
+		return okEnvelope(runtime.RegisterManagement())
+	case pluginabi.MethodManagementHandle:
+		runtime, err := loadedRuntime()
+		if err != nil {
+			return errorEnvelopeFor(err), nil
+		}
+		var req rpcManagementRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return errorEnvelopeFor(err), nil
+		}
+		response, err := runtime.HandleManagement(context.Background(), req.ManagementRequest, req.HostCallbackID)
+		if err != nil {
+			return errorEnvelopeFor(err), nil
+		}
+		return okEnvelope(response)
+	case pluginabi.MethodQuotaIdentifier:
+		return okEnvelope(map[string]string{"identifier": userrouting.QuotaProviderIdentifier()})
+	case pluginabi.MethodQuotaDescribe:
+		runtime, err := loadedRuntime()
+		if err != nil {
+			return errorEnvelopeFor(err), nil
+		}
+		return okEnvelope(runtime.DescribeQuota(context.Background()))
+	case pluginabi.MethodQuotaFetch:
+		runtime, err := loadedRuntime()
+		if err != nil {
+			return errorEnvelopeFor(err), nil
+		}
+		var req rpcQuotaFetchRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return errorEnvelopeFor(err), nil
+		}
+		response, err := runtime.FetchQuota(context.Background(), req.QuotaFetchRequest, req.HostCallbackID)
+		if err != nil {
+			return errorEnvelopeFor(err), nil
+		}
+		return okEnvelope(response)
+	case pluginabi.MethodQuotaReset:
+		runtime, err := loadedRuntime()
+		if err != nil {
+			return errorEnvelopeFor(err), nil
+		}
+		var req rpcQuotaResetRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return errorEnvelopeFor(err), nil
+		}
+		return okEnvelope(runtime.ResetQuota(context.Background(), req.QuotaResetRequest, req.HostCallbackID))
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method, http.StatusNotFound), nil
 	}
@@ -273,8 +353,13 @@ func loadedRuntime() (*userrouting.Runtime, error) {
 	return runtime, nil
 }
 
-func pluginRegistration() registration {
+func pluginRegistration(runtime *userrouting.Runtime) registration {
 	formats := []string{"openai", "openai-response", "claude", "gemini", "openai-video"}
+	quotaEnabled, resourceEnabled := false, false
+	if runtime != nil {
+		quotaEnabled = runtime.QuotaProviderEnabled()
+		resourceEnabled = runtime.QuotaResourceEnabled()
+	}
 	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
@@ -286,7 +371,10 @@ func pluginRegistration() registration {
 				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable downstream API-key model prefix routing."},
 				{Name: "cpa_config_path", Type: pluginapi.ConfigFieldTypeString, Description: "CPA config.yaml path. Empty uses the CPA -config argument, CPA_CONFIG_PATH, or ./config.yaml."},
 				{Name: "prefix_map", Type: pluginapi.ConfigFieldTypeObject, Description: "Map native CPA api-keys to model prefixes. The reserved default key is the fallback prefix."},
+				{Name: "register_deduplicated_models", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Register additional deduplicated unprefixed models in CPA's model catalog."},
+				{Name: "include_default_prefix", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Include the reserved default prefix when building the deduplication prefix list."},
 				{Name: "quota_fallback", Type: pluginapi.ConfigFieldTypeObject, Description: "Optional ordered cross-prefix fallback. Set fallback_on_other_errors to retry other upstream errors too."},
+				{Name: "quota_provider", Type: pluginapi.ConfigFieldTypeObject, Description: "Register the Codex quota provider and the downstream API-key quota resource endpoint."},
 				{Name: "strict_key_validation", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Reject mapped keys that are not present in CPA api-keys."},
 				{Name: "models_url", Type: pluginapi.ConfigFieldTypeString, Description: "Optional absolute CPA /v1/models URL; normally derived from config.yaml."},
 				{Name: "model_cache_ttl", Type: pluginapi.ConfigFieldTypeString, Description: "How long to cache the CPA model catalog, for example 5s."},
@@ -296,8 +384,11 @@ func pluginRegistration() registration {
 			},
 		},
 		Capabilities: registrationCapability{
+			ModelRegistrar:        true,
 			ModelRouter:           true,
 			Executor:              true,
+			ManagementAPI:         resourceEnabled,
+			QuotaProvider:         quotaEnabled,
 			ExecutorModelScope:    string(pluginapi.ExecutorModelScopeStatic),
 			ExecutorInputFormats:  append([]string(nil), formats...),
 			ExecutorOutputFormats: append([]string(nil), formats...),

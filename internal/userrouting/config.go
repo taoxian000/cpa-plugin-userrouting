@@ -76,13 +76,24 @@ type pluginConfig struct {
 	Enabled                     bool                `yaml:"enabled"`
 	CPAConfigPath               string              `yaml:"cpa_config_path"`
 	PrefixMap                   PrefixMap           `yaml:"prefix_map"`
+	RegisterDeduplicatedModels  bool                `yaml:"register_deduplicated_models"`
+	IncludeDefaultPrefix        bool                `yaml:"include_default_prefix"`
 	QuotaFallback               quotaFallbackConfig `yaml:"quota_fallback"`
+	QuotaProvider               quotaProviderConfig `yaml:"quota_provider"`
 	StrictKeyValidation         bool                `yaml:"strict_key_validation"`
 	ModelsURL                   string              `yaml:"models_url"`
 	ModelCacheTTL               string              `yaml:"model_cache_ttl"`
 	ModelLookupTimeout          string              `yaml:"model_lookup_timeout"`
 	ModelsTLSInsecureSkipVerify bool                `yaml:"models_tls_insecure_skip_verify"`
 	LogRouting                  bool                `yaml:"log_routing"`
+}
+
+// quotaProviderConfig controls the Codex quota provider and its public resource
+// endpoint. It is enabled by default because the capability is read-only and
+// all public requests still require a valid CPA downstream API key.
+type quotaProviderConfig struct {
+	Enabled        bool `yaml:"enabled"`
+	PublicEndpoint bool `yaml:"public_endpoint"`
 }
 
 // quotaFallbackConfig defines ordered model-prefix substitutions used only after
@@ -96,7 +107,10 @@ type quotaFallbackConfig struct {
 type runtimeConfig struct {
 	Enabled                     bool
 	PrefixMap                   PrefixMap
+	RegisterDeduplicatedModels  bool
+	IncludeDefaultPrefix        bool
 	QuotaFallback               quotaFallbackConfig
+	QuotaProvider               quotaProviderConfig
 	StrictKeyValidation         bool
 	ModelsURL                   string
 	ModelCacheTTL               time.Duration
@@ -113,8 +127,13 @@ type ConfigureOptions struct {
 
 func decodeRuntimeConfig(raw []byte, opts ConfigureOptions) (runtimeConfig, error) {
 	cfg := pluginConfig{
-		Enabled:             true,
-		PrefixMap:           PrefixMap{"default": ""},
+		Enabled:              true,
+		PrefixMap:            PrefixMap{"default": ""},
+		IncludeDefaultPrefix: true,
+		QuotaProvider: quotaProviderConfig{
+			Enabled:        true,
+			PublicEndpoint: true,
+		},
 		StrictKeyValidation: true,
 		ModelCacheTTL:       defaultModelCacheTTL.String(),
 		ModelLookupTimeout:  defaultModelLookupTimeout.String(),
@@ -176,7 +195,10 @@ func decodeRuntimeConfig(raw []byte, opts ConfigureOptions) (runtimeConfig, erro
 	return runtimeConfig{
 		Enabled:                     cfg.Enabled,
 		PrefixMap:                   clonePrefixMap(cfg.PrefixMap),
+		RegisterDeduplicatedModels:  cfg.RegisterDeduplicatedModels,
+		IncludeDefaultPrefix:        cfg.IncludeDefaultPrefix,
 		QuotaFallback:               quotaFallback,
+		QuotaProvider:               cfg.QuotaProvider,
 		StrictKeyValidation:         cfg.StrictKeyValidation,
 		ModelsURL:                   modelsURL,
 		ModelCacheTTL:               cacheTTL,

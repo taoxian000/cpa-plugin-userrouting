@@ -22,6 +22,10 @@
 
 插件不会把 API Key 写入日志。模型目录默认缓存 5 秒。
 
+### 去重模型注册
+
+默认关闭。启用 `register_deduplicated_models` 后，插件会通过 CPA 的模型注册能力，额外注册去掉配置前缀并去重后的模型名；CPA 原有的带前缀模型仍会保留。`include_default_prefix` 默认开启，非空的 `default` 前缀也会参与剥离；关闭后只使用各 API Key 对应的前缀。该能力需要 CPA v7.2.155 或更高版本。
+
 已知问题：本插件目前不能与 [cpa-plugin-codexcomp](https://github.com/uf-hy/cpa-plugin-codexcomp) 同时启用，否则 Codex 的 WebSocket 请求可能因响应流未收到 `response.completed` 而返回 408。
 
 ### Codex 跨前缀额度回退
@@ -40,6 +44,25 @@ quota_fallback:
 ```
 
 该列表只执行一层、按给定顺序尝试。默认只有 `usage_limit_reached` 会触发切换；将 `fallback_on_other_errors` 设为 `true` 后，其他上游错误也会触发切换。已经向客户端输出内容的流式请求不会切换。每次切换都会由 CPA 主日志记录为 `quota_fallback=true`。
+
+### Codex 额度查询
+
+插件实现了 CPA 的 `QuotaProvider`，当前只支持 Codex。该能力需要包含 `QuotaProvider` ABI 的 CPA v7.3.9 或更高版本。启用后，CPA 自己的 Management API 可以按认证文件查询 Codex 的额度；同时默认注册一个不需要 CPA Management Key 的公开资源接口：
+
+```text
+GET /v0/resource/plugins/user-routing/quota
+Authorization: Bearer <CPA 下游 API Key>
+```
+
+插件会读取请求 Key 对应的名义前缀，并按 `quota_fallback.prefixes` 依次查询后继前缀的 Codex 认证文件。响应中的 `nominal_prefix` 是 `prefix_map` 的 Key-前缀映射值；每个 `prefixes[].actual_prefix` 是额度查询实际使用的前缀，顶层 `actual_prefix` 是当前查询中第一个仍有剩余额度的候选，因此可以同时看到名义前缀和额度回退后的实际前缀。插件不会返回认证文件索引、邮箱、令牌或原始认证 JSON。
+
+```yaml
+quota_provider:
+  enabled: true
+  public_endpoint: true
+```
+
+`public_endpoint: false` 时仍保留 CPA 原生 `QuotaProvider` 能力，但不注册公开资源接口。Codex 额度通过 ChatGPT/Codex 的 `/backend-api/wham/usage` 读取；该上游接口属于非公开实现，接口格式变化可能导致查询失败。
 
 支持的 API/协议：
 
@@ -132,9 +155,13 @@ prefix_map: '{"apikey_1":"prefix_1/","apikey_2":"prefix_2/","default":""}'
 | `enabled` | `true` | 是否启用插件 |
 | `cpa_config_path` | 自动发现 | 优先使用 CPA 的 `-config` 参数，其次 `CPA_CONFIG_PATH`，最后 `./config.yaml` |
 | `prefix_map` | `{"default":""}` | 原生 Key 到前缀的映射；`default` 为回退前缀 |
+| `register_deduplicated_models` | `false` | 是否向 CPA 额外注册去前缀并去重的模型 |
+| `include_default_prefix` | `true` | 是否将非空 `default` 前缀加入去重前缀列表 |
 | `quota_fallback.enabled` | `false` | 是否在 Codex 账号返回 `usage_limit_reached` 时启用跨前缀模型回退 |
 | `quota_fallback.fallback_on_other_errors` | `false` | 是否也在其他上游错误时进行跨前缀模型回退；流式请求仅在输出首个内容前回退 |
 | `quota_fallback.prefixes` | 空 | 源前缀到按顺序尝试的目标前缀列表 |
+| `quota_provider.enabled` | `true` | 是否注册 Codex `QuotaProvider` |
+| `quota_provider.public_endpoint` | `true` | 是否注册无需 Management Key、但要求下游 API Key 的额度查询资源接口 |
 | `strict_key_validation` | `true` | 映射中出现不在 CPA `api-keys` 内的 Key 时拒绝加载 |
 | `models_url` | 自动推导 | CPA `/v1/models` 的绝对地址 |
 | `model_cache_ttl` | `5s` | 模型目录缓存时间，`0s` 表示不缓存 |

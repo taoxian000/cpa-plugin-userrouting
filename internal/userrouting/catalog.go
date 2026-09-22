@@ -50,6 +50,16 @@ func (c *modelCatalog) Exists(ctx context.Context, apiKey, model string) (bool, 
 	return ok, nil
 }
 
+// Models fetches a fresh model snapshot for the supplied CPA API key. It is
+// intentionally uncached because different downstream keys may expose
+// different prefixed model catalogs.
+func (c *modelCatalog) Models(ctx context.Context, apiKey string) (map[string]struct{}, error) {
+	if c == nil {
+		return nil, fmt.Errorf("model catalog is unavailable")
+	}
+	return c.fetch(ctx, apiKey)
+}
+
 func (c *modelCatalog) snapshot(ctx context.Context, apiKey string) (map[string]struct{}, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -57,6 +67,16 @@ func (c *modelCatalog) snapshot(ctx context.Context, apiKey string) (map[string]
 		return c.models, nil
 	}
 
+	models, err := c.fetch(ctx, apiKey)
+	if err != nil {
+		return nil, err
+	}
+	c.models = models
+	c.expiresAt = time.Now().Add(c.ttl)
+	return models, nil
+}
+
+func (c *modelCatalog) fetch(ctx context.Context, apiKey string) (map[string]struct{}, error) {
 	lookupCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(lookupCtx, http.MethodGet, c.url, nil)
@@ -89,8 +109,6 @@ func (c *modelCatalog) snapshot(ctx context.Context, apiKey string) (map[string]
 			models[id] = struct{}{}
 		}
 	}
-	c.models = models
-	c.expiresAt = time.Now().Add(c.ttl)
 	return models, nil
 }
 
