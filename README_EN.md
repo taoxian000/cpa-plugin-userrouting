@@ -54,7 +54,7 @@ GET /v0/resource/plugins/user-routing/quota
 Authorization: Bearer <CPA downstream API key>
 ```
 
-The request key selects the nominal prefix from `prefix_map`. The plugin then queries Codex credentials for that prefix and the ordered successors in `quota_fallback.prefixes`. The response's `nominal_prefix` is the prefix from the key-to-prefix map, while each `prefixes[].actual_prefix` is the prefix actually queried after quota fallback expansion. The top-level `actual_prefix` is the first candidate that still has remaining quota. Credential indexes, email addresses, tokens, and raw auth JSON are never returned.
+The request key selects the nominal prefix from `prefix_map`. The plugin then queries Codex credentials for that prefix and the ordered successors in `quota_fallback.prefixes`. The response keeps only the entries matching the nominal and selected actual prefixes instead of returning the full `prefixes` list: `nominal_prefix` and `actual_prefix` identify the two prefixes, while `nominal_accounts` and `actual_accounts` are dictionaries keyed by credential email with quota results as values. Credential indexes, tokens, and raw auth JSON are never returned.
 
 ```yaml
 quota_provider:
@@ -110,7 +110,7 @@ Copy the dynamic library to CPA's `plugins.dir` directory. The plugin ID is dete
 
 ### GitHub Release builds
 
-Pushing a Git tag that matches `v*` automatically triggers GitHub Actions. The workflow runs tests first, then builds shared libraries for Windows, Linux, and macOS on `amd64` and `arm64`, plus FreeBSD `amd64`.
+Pushing a Git tag that matches `v*` automatically triggers GitHub Actions. The workflow runs tests first, then builds shared libraries for Windows, Linux, and macOS on `amd64` and `arm64`.
 
 Each target is published as a separate ZIP asset containing only its corresponding `user-routing` shared library. The release also includes a `.sha256` file for every ZIP and an aggregated `checksums.txt`. For example, to publish a new version:
 

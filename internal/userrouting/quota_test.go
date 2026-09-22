@@ -60,8 +60,8 @@ func TestQuotaResourceReturnsNominalAndActualPrefixes(t *testing.T) {
 	path := writeCPAConfig(t, "key-1")
 	host := &quotaResourceHost{
 		auths: map[string]quotaTestAuth{
-			"auth-1": {prefix: "prefix1", token: "token-1", remaining: 0},
-			"auth-2": {prefix: "prefix2", token: "token-2", remaining: 0.5},
+			"auth-1": {prefix: "prefix1", email: "one@example.com", token: "token-1", remaining: 0},
+			"auth-2": {prefix: "prefix2", email: "two@example.com", token: "token-2", remaining: 0.5},
 		},
 	}
 	runtime := &Runtime{
@@ -93,17 +93,17 @@ func TestQuotaResourceReturnsNominalAndActualPrefixes(t *testing.T) {
 	if decoded.NominalPrefix != "prefix1/" || decoded.ActualPrefix != "prefix2/" {
 		t.Fatalf("top-level prefixes = (%q, %q), want (prefix1/, prefix2/)", decoded.NominalPrefix, decoded.ActualPrefix)
 	}
-	if len(decoded.Prefixes) != 2 {
-		t.Fatalf("prefix results = %#v, want nominal plus fallback", decoded.Prefixes)
+	if len(decoded.NominalAccounts) != 1 || len(decoded.ActualAccounts) != 1 {
+		t.Fatalf("selected accounts = (%#v, %#v), want one account for nominal and actual", decoded.NominalAccounts, decoded.ActualAccounts)
 	}
-	if decoded.Prefixes[0].NominalPrefix != "prefix1/" || decoded.Prefixes[0].ActualPrefix != "prefix1/" {
-		t.Fatalf("nominal result prefixes = (%q, %q)", decoded.Prefixes[0].NominalPrefix, decoded.Prefixes[0].ActualPrefix)
+	if _, ok := decoded.NominalAccounts["one@example.com"]; !ok {
+		t.Fatalf("nominal account = %#v, want one@example.com", decoded.NominalAccounts)
 	}
-	if decoded.Prefixes[1].NominalPrefix != "prefix1/" || decoded.Prefixes[1].ActualPrefix != "prefix2/" {
-		t.Fatalf("fallback result prefixes = (%q, %q)", decoded.Prefixes[1].NominalPrefix, decoded.Prefixes[1].ActualPrefix)
+	if _, ok := decoded.ActualAccounts["two@example.com"]; !ok {
+		t.Fatalf("actual account = %#v, want two@example.com", decoded.ActualAccounts)
 	}
-	if len(decoded.Prefixes[0].Accounts) != 1 || len(decoded.Prefixes[1].Accounts) != 1 {
-		t.Fatalf("accounts = %#v, want one account per prefix", decoded.Prefixes)
+	if strings.Contains(string(response.Body), `"prefixes"`) {
+		t.Fatalf("response exposes internal prefix list: %s", response.Body)
 	}
 	if strings.Contains(string(response.Body), "key-1") || strings.Contains(string(response.Body), "token-") {
 		t.Fatalf("response contains credential material: %s", response.Body)
@@ -112,6 +112,7 @@ func TestQuotaResourceReturnsNominalAndActualPrefixes(t *testing.T) {
 
 type quotaTestAuth struct {
 	prefix    string
+	email     string
 	token     string
 	remaining float64
 }
@@ -124,8 +125,8 @@ func (h *quotaResourceHost) Call(method string, payload any) (json.RawMessage, e
 	switch method {
 	case pluginabi.MethodHostAuthList:
 		files := make([]pluginapi.HostAuthFileEntry, 0, len(h.auths))
-		for index := range h.auths {
-			files = append(files, pluginapi.HostAuthFileEntry{AuthIndex: index, ID: index, Provider: quotaCodexProvider})
+		for index, auth := range h.auths {
+			files = append(files, pluginapi.HostAuthFileEntry{AuthIndex: index, ID: index, Provider: quotaCodexProvider, Email: auth.email})
 		}
 		return json.Marshal(hostAuthListResponse{Files: files})
 	case pluginabi.MethodHostAuthGet:
@@ -143,6 +144,7 @@ func (h *quotaResourceHost) Call(method string, payload any) (json.RawMessage, e
 		}
 		storage, _ := json.Marshal(map[string]any{
 			"prefix":       auth.prefix,
+			"email":        auth.email,
 			"access_token": auth.token,
 			"account_id":   "account-" + request.AuthIndex,
 		})

@@ -54,7 +54,7 @@ GET /v0/resource/plugins/user-routing/quota
 Authorization: Bearer <CPA 下游 API Key>
 ```
 
-插件会读取请求 Key 对应的名义前缀，并按 `quota_fallback.prefixes` 依次查询后继前缀的 Codex 认证文件。响应中的 `nominal_prefix` 是 `prefix_map` 的 Key-前缀映射值；每个 `prefixes[].actual_prefix` 是额度查询实际使用的前缀，顶层 `actual_prefix` 是当前查询中第一个仍有剩余额度的候选，因此可以同时看到名义前缀和额度回退后的实际前缀。插件不会返回认证文件索引、邮箱、令牌或原始认证 JSON。
+插件会读取请求 Key 对应的名义前缀，并按 `quota_fallback.prefixes` 依次查询后继前缀的 Codex 认证文件。响应只保留名义前缀和实际前缀对应的认证账户，不再返回完整的 `prefixes` 列表：`nominal_prefix` 与 `actual_prefix` 表示两种前缀，`nominal_accounts` 与 `actual_accounts` 是以认证账户邮箱为键、额度结果为值的字典。插件不会返回认证文件索引、令牌或原始认证 JSON。
 
 ```yaml
 quota_provider:
@@ -110,7 +110,7 @@ Linux：
 
 ### GitHub Release 构建
 
-推送匹配 `v*` 的 Git 标签会自动触发 GitHub Actions。工作流先运行测试，然后构建以下动态库：Windows、Linux、macOS 的 `amd64` 与 `arm64`，以及 FreeBSD `amd64`。
+推送匹配 `v*` 的 Git 标签会自动触发 GitHub Actions。工作流先运行测试，然后构建 Windows、Linux、macOS 的 `amd64` 与 `arm64` 动态库。
 
 每个目标平台会作为独立 ZIP 资产发布，ZIP 内只包含对应的 `user-routing` 动态库；Release 还包含每个 ZIP 的 `.sha256` 文件和汇总的 `checksums.txt`。例如，发布新版本：
 

@@ -130,23 +130,18 @@ func (r *Runtime) ResetQuota(context.Context, pluginapi.QuotaResetRequest, strin
 }
 
 type quotaResourceResponse struct {
-	NominalPrefix string                      `json:"nominal_prefix"`
-	ActualPrefix  string                      `json:"actual_prefix,omitempty"`
-	Prefixes      []quotaResourcePrefixResult `json:"prefixes"`
-	Partial       bool                        `json:"partial"`
+	NominalPrefix   string                                  `json:"nominal_prefix"`
+	ActualPrefix    string                                  `json:"actual_prefix,omitempty"`
+	NominalAccounts map[string]pluginapi.QuotaFetchResponse `json:"nominal_accounts,omitempty"`
+	ActualAccounts  map[string]pluginapi.QuotaFetchResponse `json:"actual_accounts,omitempty"`
+	Errors          []string                                `json:"errors,omitempty"`
+	Partial         bool                                    `json:"partial"`
 }
 
-type quotaResourcePrefixResult struct {
-	NominalPrefix string                 `json:"nominal_prefix"`
-	ActualPrefix  string                 `json:"actual_prefix"`
-	Provider      string                 `json:"provider"`
-	Accounts      []quotaResourceAccount `json:"accounts,omitempty"`
-	Errors        []string               `json:"errors,omitempty"`
-}
-
-type quotaResourceAccount struct {
-	Provider string                       `json:"provider"`
-	Quota    pluginapi.QuotaFetchResponse `json:"quota"`
+type quotaPrefixResult struct {
+	Prefix   string
+	Accounts map[string]pluginapi.QuotaFetchResponse
+	Errors   []string
 }
 
 func (r *Runtime) RegisterManagement() pluginapi.ManagementRegistrationResponse {
@@ -203,13 +198,14 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 		return quotaJSONResponse(http.StatusBadGateway, map[string]string{"error": "invalid CPA auth list response"}), nil
 	}
 
-	result := quotaResourceResponse{NominalPrefix: normalizePrefix(nominalName), Prefixes: make([]quotaResourcePrefixResult, 0, len(candidates))}
+	nominalPrefix = normalizePrefix(nominalName)
+	prefixResults := make([]quotaPrefixResult, 0, len(candidates))
 	actualSet := false
+	actualPrefix := nominalPrefix
 	for _, candidate := range candidates {
-		prefixResult := quotaResourcePrefixResult{
-			NominalPrefix: normalizePrefix(nominalName),
-			ActualPrefix:  normalizePrefix(candidate),
-			Provider:      quotaCodexProvider,
+		prefixResult := quotaPrefixResult{
+			Prefix:   normalizePrefix(candidate),
+			Accounts: make(map[string]pluginapi.QuotaFetchResponse),
 		}
 		for _, entry := range listed.Files {
 			if entry.Disabled || entry.Unavailable || !strings.EqualFold(strings.TrimSpace(entry.Provider), quotaCodexProvider) {
@@ -222,6 +218,14 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 			}
 			material := decodeAuthMaterial(rawAuth)
 			if material.prefix() != candidate {
+				continue
+			}
+			account := strings.TrimSpace(entry.Email)
+			if account == "" {
+				account = material.email()
+			}
+			if account == "" {
+				prefixResult.Errors = append(prefixResult.Errors, "one Codex credential has no email address")
 				continue
 			}
 			quota, errQuota := r.FetchQuota(ctx, pluginapi.QuotaFetchRequest{
@@ -237,41 +241,55 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 				prefixResult.Errors = append(prefixResult.Errors, "one Codex quota query failed")
 				continue
 			}
-			prefixResult.Accounts = append(prefixResult.Accounts, quotaResourceAccount{Provider: quotaCodexProvider, Quota: quota})
-		}
-		if len(prefixResult.Errors) > 0 {
-			result.Partial = true
+			prefixResult.Accounts[account] = quota
 		}
 		if !actualSet && quotaPrefixHasRemaining(prefixResult) {
-			result.ActualPrefix = prefixResult.ActualPrefix
+			actualPrefix = prefixResult.Prefix
 			actualSet = true
 		}
-		result.Prefixes = append(result.Prefixes, prefixResult)
+		prefixResults = append(prefixResults, prefixResult)
 	}
-	if len(result.Prefixes) == 0 {
+	if len(prefixResults) == 0 {
 		return quotaJSONResponse(http.StatusNotFound, map[string]string{"error": "no Codex credential matches the configured prefix"}), nil
 	}
-	if result.ActualPrefix == "" {
-		result.ActualPrefix = result.NominalPrefix
+	result := quotaResourceResponse{
+		NominalPrefix:   nominalPrefix,
+		ActualPrefix:    actualPrefix,
+		NominalAccounts: make(map[string]pluginapi.QuotaFetchResponse),
+		ActualAccounts:  make(map[string]pluginapi.QuotaFetchResponse),
 	}
-	if len(result.Prefixes) > 0 {
-		matched := false
-		for _, prefix := range result.Prefixes {
-			if len(prefix.Accounts) > 0 {
-				matched = true
-				break
+	matched := false
+	for _, prefix := range prefixResults {
+		if prefix.Prefix != nominalPrefix && prefix.Prefix != actualPrefix {
+			continue
+		}
+		if len(prefix.Errors) > 0 {
+			result.Partial = true
+			result.Errors = append(result.Errors, prefix.Errors...)
+		}
+		if len(prefix.Accounts) > 0 {
+			matched = true
+		}
+		if prefix.Prefix == nominalPrefix {
+			for account, quota := range prefix.Accounts {
+				result.NominalAccounts[account] = quota
 			}
 		}
-		if !matched {
-			return quotaJSONResponse(http.StatusNotFound, result), nil
+		if prefix.Prefix == actualPrefix {
+			for account, quota := range prefix.Accounts {
+				result.ActualAccounts[account] = quota
+			}
 		}
+	}
+	if !matched {
+		return quotaJSONResponse(http.StatusNotFound, result), nil
 	}
 	return quotaJSONResponse(http.StatusOK, result), nil
 }
 
-func quotaPrefixHasRemaining(prefix quotaResourcePrefixResult) bool {
-	for _, account := range prefix.Accounts {
-		for _, group := range account.Quota.Groups {
+func quotaPrefixHasRemaining(prefix quotaPrefixResult) bool {
+	for _, quota := range prefix.Accounts {
+		for _, group := range quota.Groups {
 			for _, bucket := range group.Buckets {
 				if bucket.RemainingFraction > 0 {
 					return true
@@ -336,6 +354,7 @@ type authMaterial struct {
 	Metadata   map[string]any
 	Attributes map[string]string
 	Prefix     string
+	Email      string
 }
 
 func decodeAuthMaterial(raw []byte) authMaterial {
@@ -356,13 +375,21 @@ func decodeAuthMaterial(raw []byte) authMaterial {
 			}
 		}
 	}
-	material := authMaterial{Metadata: metadata, Attributes: stringMapValue(root, "attributes")}
+	material := authMaterial{
+		Metadata:   metadata,
+		Attributes: stringMapValue(root, "attributes"),
+		Email:      firstString(root, "email", "metadata.email", "attributes.email"),
+	}
 	material.Prefix = firstString(root, "prefix", "metadata.prefix", "attributes.prefix")
 	return material
 }
 
 func (m authMaterial) prefix() string {
 	return normalizePrefixName(m.Prefix)
+}
+
+func (m authMaterial) email() string {
+	return strings.TrimSpace(m.Email)
 }
 
 func firstString(root map[string]any, paths ...string) string {
