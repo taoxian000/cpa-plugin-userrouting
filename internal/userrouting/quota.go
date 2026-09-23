@@ -2,6 +2,7 @@ package userrouting
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ const (
 	quotaProviderIdentifier = "user-routing-quota"
 	quotaProviderName       = "Codex quota"
 	quotaResourcePath       = "/quota"
+	quotaResetResourcePath  = "/quota/reset"
 	quotaCodexProvider      = "codex"
 )
 
@@ -102,7 +104,7 @@ func (r *Runtime) DescribeQuota(context.Context) pluginapi.QuotaDescribeResponse
 	return pluginapi.QuotaDescribeResponse{
 		SupportedProviders: []string{quotaCodexProvider},
 		DisplayName:        quotaProviderName,
-		SupportsReset:      false,
+		SupportsReset:      true,
 	}
 }
 
@@ -120,28 +122,128 @@ func (r *Runtime) FetchQuota(ctx context.Context, req pluginapi.QuotaFetchReques
 	return fetchCodexQuota(ctx, req)
 }
 
-// ResetQuota is intentionally read-only. CPA still requires the method for
-// the QuotaProvider ABI, so report a structured unsupported result.
-func (r *Runtime) ResetQuota(context.Context, pluginapi.QuotaResetRequest, string) pluginapi.QuotaResetResponse {
-	return pluginapi.QuotaResetResponse{
-		Success: false,
-		Message: "Codex quota reset is not supported by user-routing",
+// ResetQuota consumes one Codex rate-limit reset credit through CPA's native
+// QuotaProvider management flow. The host HTTP callback preserves CPA's
+// outbound proxy and TLS policy.
+func (r *Runtime) ResetQuota(ctx context.Context, req pluginapi.QuotaResetRequest, callbackID string) pluginapi.QuotaResetResponse {
+	if r == nil || !r.config.Enabled || !r.config.QuotaProvider.Enabled {
+		return pluginapi.QuotaResetResponse{Message: "quota provider is disabled"}
 	}
+	if !strings.EqualFold(strings.TrimSpace(req.Provider), quotaCodexProvider) {
+		return pluginapi.QuotaResetResponse{Message: "unsupported quota provider"}
+	}
+	if req.HTTPClient == nil {
+		req.HTTPClient = &quotaHTTPClient{host: r.host, callbackID: callbackID}
+	}
+	accessToken, accountID, baseURL, err := codexRequestCredentials(req.StorageJSON, req.Metadata, req.Attributes)
+	if err != nil {
+		return pluginapi.QuotaResetResponse{Message: "Codex credentials are unavailable"}
+	}
+	creditsURL, err := codexResetCreditsURL(baseURL)
+	if err != nil {
+		return pluginapi.QuotaResetResponse{Message: "invalid Codex base URL"}
+	}
+	headers := codexRequestHeaders(accessToken, accountID)
+	creditsResponse, err := req.HTTPClient.Do(ctx, pluginapi.HTTPRequest{Method: http.MethodGet, URL: creditsURL, Headers: headers})
+	if err != nil || creditsResponse.StatusCode < http.StatusOK || creditsResponse.StatusCode >= http.StatusMultipleChoices {
+		return pluginapi.QuotaResetResponse{Message: "unable to check Codex reset-credit availability"}
+	}
+	credits, err := parseCodexResetCredits(creditsResponse.Body, nil)
+	if err != nil {
+		return pluginapi.QuotaResetResponse{Message: "invalid Codex reset-credit response"}
+	}
+	if credits.AvailableCount < 1 {
+		return pluginapi.QuotaResetResponse{Message: "no Codex quota reset credits are available"}
+	}
+	creditID := firstAvailableCodexResetCreditID(creditsResponse.Body)
+	if creditID == "" {
+		return pluginapi.QuotaResetResponse{Message: "no selectable Codex quota reset credit details are available"}
+	}
+	requestID, err := newRedeemRequestID()
+	if err != nil {
+		return pluginapi.QuotaResetResponse{Message: "could not create a reset request identifier"}
+	}
+	consumeURL, err := codexResetConsumeURL(baseURL)
+	if err != nil {
+		return pluginapi.QuotaResetResponse{Message: "invalid Codex base URL"}
+	}
+	body, _ := json.Marshal(map[string]string{"redeem_request_id": requestID, "credit_id": creditID})
+	consumeHeaders := codexRequestHeaders(accessToken, accountID)
+	consumeHeaders.Set("Content-Type", "application/json")
+	consumeResponse, err := req.HTTPClient.Do(ctx, pluginapi.HTTPRequest{
+		Method:  http.MethodPost,
+		URL:     consumeURL,
+		Headers: consumeHeaders,
+		Body:    body,
+	})
+	if err != nil || consumeResponse.StatusCode < http.StatusOK || consumeResponse.StatusCode >= http.StatusMultipleChoices {
+		return pluginapi.QuotaResetResponse{Message: "Codex reset-credit consumption failed; the final account state may be uncertain"}
+	}
+	var result struct {
+		Code         string `json:"code"`
+		WindowsReset int    `json:"windows_reset"`
+	}
+	if json.Unmarshal(consumeResponse.Body, &result) != nil || (result.Code != "reset" && result.WindowsReset < 1) {
+		return pluginapi.QuotaResetResponse{Message: "Codex did not confirm reset-credit consumption"}
+	}
+	return pluginapi.QuotaResetResponse{Success: true, Message: "Codex quota reset credit consumed"}
+}
+
+type quotaResetCreditInfo struct {
+	AvailableCount         int      `json:"available_count"`
+	ExpiresAt              []string `json:"expires_at"`
+	WithoutExpiry          int      `json:"without_expiry,omitempty"`
+	ExpiryDetailsAvailable bool     `json:"expiry_details_available"`
+	ExpiryDetailsComplete  bool     `json:"expiry_details_complete"`
+}
+
+type quotaResourceAccount struct {
+	pluginapi.QuotaFetchResponse
+	ResetCredits quotaResetCreditInfo `json:"reset_credits"`
+}
+
+func (a *quotaResourceAccount) UnmarshalJSON(raw []byte) error {
+	var quota pluginapi.QuotaFetchResponse
+	if err := json.Unmarshal(raw, &quota); err != nil {
+		return err
+	}
+	var extra struct {
+		ResetCredits quotaResetCreditInfo `json:"reset_credits"`
+	}
+	if err := json.Unmarshal(raw, &extra); err != nil {
+		return err
+	}
+	a.QuotaFetchResponse = quota
+	a.ResetCredits = extra.ResetCredits
+	return nil
 }
 
 type quotaResourceResponse struct {
-	NominalPrefix   string                                  `json:"nominal_prefix"`
-	ActualPrefix    string                                  `json:"actual_prefix,omitempty"`
-	NominalAccounts map[string]pluginapi.QuotaFetchResponse `json:"nominal_accounts,omitempty"`
-	ActualAccounts  map[string]pluginapi.QuotaFetchResponse `json:"actual_accounts,omitempty"`
-	Errors          []string                                `json:"errors,omitempty"`
-	Partial         bool                                    `json:"partial"`
+	NominalPrefix   string                          `json:"nominal_prefix"`
+	ActualPrefix    string                          `json:"actual_prefix,omitempty"`
+	NominalAccounts map[string]quotaResourceAccount `json:"nominal_accounts,omitempty"`
+	ActualAccounts  map[string]quotaResourceAccount `json:"actual_accounts,omitempty"`
+	Errors          []string                        `json:"errors,omitempty"`
+	Partial         bool                            `json:"partial"`
 }
 
 type quotaPrefixResult struct {
 	Prefix   string
-	Accounts map[string]pluginapi.QuotaFetchResponse
+	Accounts map[string]quotaResourceAccount
 	Errors   []string
+}
+
+type quotaResetResourceAccount struct {
+	Success bool   `json:"success"`
+	Message string `json:"message,omitempty"`
+}
+
+type quotaResetResourceResponse struct {
+	NominalPrefix   string                               `json:"nominal_prefix"`
+	NominalAccounts map[string]quotaResetResourceAccount `json:"nominal_accounts,omitempty"`
+	Success         bool                                 `json:"success"`
+	Partial         bool                                 `json:"partial"`
+	Errors          []string                             `json:"errors,omitempty"`
 }
 
 func (r *Runtime) RegisterManagement() pluginapi.ManagementRegistrationResponse {
@@ -149,10 +251,16 @@ func (r *Runtime) RegisterManagement() pluginapi.ManagementRegistrationResponse 
 		return pluginapi.ManagementRegistrationResponse{}
 	}
 	return pluginapi.ManagementRegistrationResponse{
-		Resources: []pluginapi.ResourceRoute{{
-			Path:        quotaResourcePath,
-			Description: "Query Codex quota using a downstream CPA API key.",
-		}},
+		Resources: []pluginapi.ResourceRoute{
+			{
+				Path:        quotaResourcePath,
+				Description: "Query Codex quota using a downstream CPA API key.",
+			},
+			{
+				Path:        quotaResetResourcePath,
+				Description: "Synchronously consume one available Codex quota reset credit for every account under a downstream key's nominal prefix.",
+			},
+		},
 	}
 }
 
@@ -197,6 +305,9 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 	if err := json.Unmarshal(listRaw, &listed); err != nil {
 		return quotaJSONResponse(http.StatusBadGateway, map[string]string{"error": "invalid CPA auth list response"}), nil
 	}
+	if isQuotaResetResourcePath(req.Path) {
+		return r.handleQuotaResetResource(ctx, nominalName, listed.Files, callbackID), nil
+	}
 
 	nominalPrefix = normalizePrefix(nominalName)
 	prefixResults := make([]quotaPrefixResult, 0, len(candidates))
@@ -205,7 +316,7 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 	for _, candidate := range candidates {
 		prefixResult := quotaPrefixResult{
 			Prefix:   normalizePrefix(candidate),
-			Accounts: make(map[string]pluginapi.QuotaFetchResponse),
+			Accounts: make(map[string]quotaResourceAccount),
 		}
 		for _, entry := range listed.Files {
 			if entry.Disabled || entry.Unavailable || !strings.EqualFold(strings.TrimSpace(entry.Provider), quotaCodexProvider) {
@@ -241,7 +352,20 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 				prefixResult.Errors = append(prefixResult.Errors, "one Codex quota query failed")
 				continue
 			}
-			prefixResult.Accounts[account] = quota
+			fetchRequest := pluginapi.QuotaFetchRequest{
+				AuthIndex:   entry.AuthIndex,
+				AuthID:      entry.ID,
+				Provider:    quotaCodexProvider,
+				StorageJSON: rawAuth,
+				Metadata:    material.Metadata,
+				Attributes:  material.Attributes,
+				HTTPClient:  &quotaHTTPClient{host: r.host, callbackID: callbackID},
+			}
+			resetCredits, errCredits := fetchCodexResetCreditInfo(ctx, fetchRequest, quota)
+			if errCredits != nil {
+				prefixResult.Errors = append(prefixResult.Errors, "one Codex reset-credit expiry query failed")
+			}
+			prefixResult.Accounts[account] = quotaResourceAccount{QuotaFetchResponse: quota, ResetCredits: resetCredits}
 		}
 		if !actualSet && quotaPrefixHasRemaining(prefixResult) {
 			actualPrefix = prefixResult.Prefix
@@ -255,8 +379,8 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 	result := quotaResourceResponse{
 		NominalPrefix:   nominalPrefix,
 		ActualPrefix:    actualPrefix,
-		NominalAccounts: make(map[string]pluginapi.QuotaFetchResponse),
-		ActualAccounts:  make(map[string]pluginapi.QuotaFetchResponse),
+		NominalAccounts: make(map[string]quotaResourceAccount),
+		ActualAccounts:  make(map[string]quotaResourceAccount),
 	}
 	matched := false
 	for _, prefix := range prefixResults {
@@ -287,9 +411,95 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 	return quotaJSONResponse(http.StatusOK, result), nil
 }
 
+func isQuotaResetResourcePath(path string) bool {
+	path = "/" + strings.Trim(strings.TrimSpace(path), "/")
+	return path == quotaResetResourcePath || strings.HasSuffix(path, "/plugins/user-routing"+quotaResetResourcePath)
+}
+
+// handleQuotaResetResource runs synchronously and only targets Codex auth files
+// whose nominal prefix matches the downstream API key. Each account gets one
+// attempt; failures are returned to the caller and are never retried.
+func (r *Runtime) handleQuotaResetResource(ctx context.Context, nominalName string, files []pluginapi.HostAuthFileEntry, callbackID string) pluginapi.ManagementResponse {
+	nominalPrefix := normalizePrefix(nominalName)
+	result := quotaResetResourceResponse{
+		NominalPrefix:   nominalPrefix,
+		NominalAccounts: make(map[string]quotaResetResourceAccount),
+	}
+	matched := 0
+	succeeded := 0
+	failed := 0
+	unresolved := 0
+	for _, entry := range files {
+		if entry.Disabled || entry.Unavailable || !strings.EqualFold(strings.TrimSpace(entry.Provider), quotaCodexProvider) {
+			continue
+		}
+		rawAuth, err := r.getAuthJSON(entry.AuthIndex)
+		if err != nil {
+			// Without the auth payload the credential's prefix cannot be safely
+			// identified, so do not report or operate on an unrelated account.
+			unresolved++
+			continue
+		}
+		material := decodeAuthMaterial(rawAuth)
+		if material.prefix() != normalizePrefixName(nominalName) {
+			continue
+		}
+		matched++
+		account := strings.TrimSpace(entry.Email)
+		if account == "" {
+			account = material.email()
+		}
+		if account == "" {
+			failed++
+			result.Errors = append(result.Errors, "one matching Codex credential has no email address")
+			continue
+		}
+		accountKey := account
+		if _, exists := result.NominalAccounts[accountKey]; exists {
+			accountKey = fmt.Sprintf("%s#%d", account, matched)
+			result.Errors = append(result.Errors, "multiple matching Codex credentials share an email address")
+		}
+		reset := r.ResetQuota(ctx, pluginapi.QuotaResetRequest{
+			AuthIndex:   entry.AuthIndex,
+			AuthID:      entry.ID,
+			Provider:    quotaCodexProvider,
+			StorageJSON: rawAuth,
+			Metadata:    material.Metadata,
+			Attributes:  material.Attributes,
+			HTTPClient:  &quotaHTTPClient{host: r.host, callbackID: callbackID},
+		}, callbackID)
+		result.NominalAccounts[accountKey] = quotaResetResourceAccount{Success: reset.Success, Message: reset.Message}
+		if reset.Success {
+			succeeded++
+		} else {
+			failed++
+		}
+	}
+	if matched == 0 {
+		if unresolved > 0 {
+			return quotaJSONResponse(http.StatusBadGateway, map[string]any{
+				"nominal_prefix": nominalPrefix,
+				"success":        false,
+				"error":          "unable to inspect all Codex credentials to resolve the nominal prefix",
+			})
+		}
+		return quotaJSONResponse(http.StatusNotFound, map[string]any{
+			"nominal_prefix": nominalPrefix,
+			"success":        false,
+			"error":          "no available Codex credential matches the downstream key's nominal prefix",
+		})
+	}
+	if unresolved > 0 {
+		result.Errors = append(result.Errors, "one or more Codex credentials could not be inspected for prefix matching")
+	}
+	result.Success = failed == 0 && unresolved == 0 && len(result.NominalAccounts) == matched
+	result.Partial = succeeded > 0 && (failed > 0 || unresolved > 0)
+	return quotaJSONResponse(http.StatusOK, result)
+}
+
 func quotaPrefixHasRemaining(prefix quotaPrefixResult) bool {
-	for _, quota := range prefix.Accounts {
-		for _, group := range quota.Groups {
+	for _, account := range prefix.Accounts {
+		for _, group := range account.QuotaFetchResponse.Groups {
 			for _, bucket := range group.Buckets {
 				if bucket.RemainingFraction > 0 {
 					return true
@@ -440,42 +650,15 @@ func fetchCodexQuota(ctx context.Context, req pluginapi.QuotaFetchRequest) (plug
 	if req.HTTPClient == nil {
 		return pluginapi.QuotaFetchResponse{}, errors.New("quota HTTP client is unavailable")
 	}
-	material := decodeAuthMaterial(req.StorageJSON)
-	if material.Metadata == nil {
-		material.Metadata = make(map[string]any)
+	accessToken, accountID, baseURL, err := codexRequestCredentials(req.StorageJSON, req.Metadata, req.Attributes)
+	if err != nil {
+		return pluginapi.QuotaFetchResponse{}, err
 	}
-	for key, value := range req.Metadata {
-		if _, exists := material.Metadata[key]; !exists {
-			material.Metadata[key] = value
-		}
-	}
-	if material.Attributes == nil {
-		material.Attributes = make(map[string]string)
-	}
-	for key, value := range req.Attributes {
-		if _, exists := material.Attributes[key]; !exists {
-			material.Attributes[key] = value
-		}
-	}
-	accessToken := firstStringFromMaps(material.Metadata, material.Attributes, "access_token", "api_key")
-	if accessToken == "" {
-		return pluginapi.QuotaFetchResponse{}, errors.New("Codex access token is unavailable")
-	}
-	baseURL := firstStringFromMaps(material.Metadata, material.Attributes, "base_url")
 	usageURL, err := codexUsageURL(baseURL)
 	if err != nil {
 		return pluginapi.QuotaFetchResponse{}, err
 	}
-	headers := http.Header{
-		"Authorization":   []string{"Bearer " + accessToken},
-		"Accept":          []string{"application/json"},
-		"OAI-Product-Sku": []string{"CODEX"},
-	}
-	accountID := firstStringFromMaps(material.Metadata, material.Attributes, "account_id")
-	if accountID != "" {
-		headers.Set("ChatGPT-Account-ID", accountID)
-	}
-	response, err := req.HTTPClient.Do(ctx, pluginapi.HTTPRequest{Method: http.MethodGet, URL: usageURL, Headers: headers})
+	response, err := req.HTTPClient.Do(ctx, pluginapi.HTTPRequest{Method: http.MethodGet, URL: usageURL, Headers: codexRequestHeaders(accessToken, accountID)})
 	if err != nil {
 		return pluginapi.QuotaFetchResponse{}, err
 	}
@@ -483,6 +666,45 @@ func fetchCodexQuota(ctx context.Context, req pluginapi.QuotaFetchRequest) (plug
 		return pluginapi.QuotaFetchResponse{}, fmt.Errorf("Codex quota endpoint returned HTTP %d", response.StatusCode)
 	}
 	return parseCodexQuotaResponse(response.Body)
+}
+
+func codexRequestCredentials(storageJSON []byte, metadata map[string]any, attributes map[string]string) (accessToken, accountID, baseURL string, err error) {
+	material := decodeAuthMaterial(storageJSON)
+	if material.Metadata == nil {
+		material.Metadata = make(map[string]any)
+	}
+	for key, value := range metadata {
+		if _, exists := material.Metadata[key]; !exists {
+			material.Metadata[key] = value
+		}
+	}
+	if material.Attributes == nil {
+		material.Attributes = make(map[string]string)
+	}
+	for key, value := range attributes {
+		if _, exists := material.Attributes[key]; !exists {
+			material.Attributes[key] = value
+		}
+	}
+	accessToken = firstStringFromMaps(material.Metadata, material.Attributes, "access_token", "api_key")
+	if accessToken == "" {
+		return "", "", "", errors.New("Codex access token is unavailable")
+	}
+	accountID = firstStringFromMaps(material.Metadata, material.Attributes, "account_id")
+	baseURL = firstStringFromMaps(material.Metadata, material.Attributes, "base_url")
+	return accessToken, accountID, baseURL, nil
+}
+
+func codexRequestHeaders(accessToken, accountID string) http.Header {
+	headers := http.Header{
+		"Authorization":   []string{"Bearer " + accessToken},
+		"Accept":          []string{"application/json"},
+		"OAI-Product-Sku": []string{"CODEX"},
+	}
+	if accountID != "" {
+		headers.Set("ChatGPT-Account-ID", accountID)
+	}
+	return headers
 }
 
 func firstStringFromMaps(metadata map[string]any, attributes map[string]string, keys ...string) string {
@@ -502,6 +724,18 @@ func firstStringFromMaps(metadata map[string]any, attributes map[string]string, 
 }
 
 func codexUsageURL(baseURL string) (string, error) {
+	return codexWHAMURL(baseURL, "usage")
+}
+
+func codexResetCreditsURL(baseURL string) (string, error) {
+	return codexWHAMURL(baseURL, "rate-limit-reset-credits")
+}
+
+func codexResetConsumeURL(baseURL string) (string, error) {
+	return codexWHAMURL(baseURL, "rate-limit-reset-credits/consume")
+}
+
+func codexWHAMURL(baseURL, endpoint string) (string, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
@@ -513,10 +747,157 @@ func codexUsageURL(baseURL string) (string, error) {
 	if strings.HasSuffix(path, "/codex") {
 		path = strings.TrimSuffix(path, "/codex")
 	}
-	u.Path = path + "/wham/usage"
+	u.Path = path + "/wham/" + strings.TrimLeft(endpoint, "/")
 	u.RawQuery = ""
 	u.Fragment = ""
 	return u.String(), nil
+}
+
+type codexResetCredit struct {
+	ID        string          `json:"id"`
+	ResetType string          `json:"reset_type"`
+	Status    string          `json:"status"`
+	ExpiresAt json.RawMessage `json:"expires_at"`
+}
+
+type codexResetCreditsResponse struct {
+	AvailableCount *int               `json:"available_count"`
+	Credits        []codexResetCredit `json:"credits"`
+}
+
+func fetchCodexResetCreditInfo(ctx context.Context, req pluginapi.QuotaFetchRequest, quota pluginapi.QuotaFetchResponse) (quotaResetCreditInfo, error) {
+	fallback := quotaResetCreditInfoFromQuota(quota)
+	if req.HTTPClient == nil {
+		return fallback, errors.New("quota HTTP client is unavailable")
+	}
+	accessToken, accountID, baseURL, err := codexRequestCredentials(req.StorageJSON, req.Metadata, req.Attributes)
+	if err != nil {
+		return fallback, err
+	}
+	creditsURL, err := codexResetCreditsURL(baseURL)
+	if err != nil {
+		return fallback, err
+	}
+	response, err := req.HTTPClient.Do(ctx, pluginapi.HTTPRequest{Method: http.MethodGet, URL: creditsURL, Headers: codexRequestHeaders(accessToken, accountID)})
+	if err != nil {
+		return fallback, err
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return fallback, fmt.Errorf("Codex reset-credit endpoint returned HTTP %d", response.StatusCode)
+	}
+	return parseCodexResetCredits(response.Body, quotaResetCreditsCount(quota))
+}
+
+func parseCodexResetCredits(raw []byte, fallbackCount *int) (quotaResetCreditInfo, error) {
+	var payload codexResetCreditsResponse
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return quotaResetCreditInfo{}, fmt.Errorf("decode Codex reset-credit response: %w", err)
+	}
+	info := quotaResetCreditInfo{ExpiryDetailsAvailable: payload.Credits != nil, ExpiresAt: make([]string, 0)}
+	availableRows := 0
+	allAvailableRowsHaveExpiry := true
+	for _, credit := range payload.Credits {
+		if !strings.EqualFold(strings.TrimSpace(credit.ResetType), "codex_rate_limits") || !strings.EqualFold(strings.TrimSpace(credit.Status), "available") {
+			continue
+		}
+		availableRows++
+		if len(credit.ExpiresAt) == 0 {
+			allAvailableRowsHaveExpiry = false
+			continue
+		}
+		if string(credit.ExpiresAt) == "null" {
+			info.WithoutExpiry++
+			continue
+		}
+		if expiry, ok := normalizeCodexExpiration(credit.ExpiresAt); ok {
+			info.ExpiresAt = append(info.ExpiresAt, expiry)
+		} else {
+			allAvailableRowsHaveExpiry = false
+		}
+	}
+	switch {
+	case payload.AvailableCount != nil:
+		info.AvailableCount = *payload.AvailableCount
+	case fallbackCount != nil:
+		info.AvailableCount = *fallbackCount
+	default:
+		info.AvailableCount = availableRows
+	}
+	info.ExpiryDetailsComplete = info.ExpiryDetailsAvailable && allAvailableRowsHaveExpiry && availableRows >= info.AvailableCount
+	return info, nil
+}
+
+func firstAvailableCodexResetCreditID(raw []byte) string {
+	var payload codexResetCreditsResponse
+	if json.Unmarshal(raw, &payload) != nil {
+		return ""
+	}
+	for _, credit := range payload.Credits {
+		if strings.EqualFold(strings.TrimSpace(credit.ResetType), "codex_rate_limits") &&
+			strings.EqualFold(strings.TrimSpace(credit.Status), "available") && strings.TrimSpace(credit.ID) != "" {
+			return strings.TrimSpace(credit.ID)
+		}
+	}
+	return ""
+}
+
+func normalizeCodexExpiration(raw json.RawMessage) (string, bool) {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		if parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(text)); err == nil {
+			return parsed.UTC().Format(time.RFC3339), true
+		}
+		return strings.TrimSpace(text), strings.TrimSpace(text) != ""
+	}
+	var value any
+	if json.Unmarshal(raw, &value) == nil {
+		seconds, ok := 0.0, false
+		switch number := value.(type) {
+		case float64:
+			seconds, ok = number, true
+		case json.Number:
+			parsed, parseErr := number.Float64()
+			seconds, ok = parsed, parseErr == nil
+		case string:
+			parsed, parseErr := strconv.ParseFloat(strings.TrimSpace(number), 64)
+			seconds, ok = parsed, parseErr == nil
+		}
+		if ok && seconds > 0 {
+			if seconds > 1_000_000_000_000 {
+				seconds /= 1000
+			}
+			return time.Unix(int64(seconds), 0).UTC().Format(time.RFC3339), true
+		}
+	}
+	return "", false
+}
+
+func quotaResetCreditInfoFromQuota(quota pluginapi.QuotaFetchResponse) quotaResetCreditInfo {
+	info := quotaResetCreditInfo{ExpiresAt: make([]string, 0)}
+	if count := quotaResetCreditsCount(quota); count != nil {
+		info.AvailableCount = *count
+	}
+	return info
+}
+
+func quotaResetCreditsCount(quota pluginapi.QuotaFetchResponse) *int {
+	for _, metric := range quota.Summary {
+		if metric.Key == "rate_limit_reset_credits_available" {
+			count := int(metric.Value)
+			return &count
+		}
+	}
+	return nil
+}
+
+func newRedeemRequestID() (string, error) {
+	var id [16]byte
+	if _, err := cryptorand.Read(id[:]); err != nil {
+		return "", err
+	}
+	id[6] = (id[6] & 0x0f) | 0x40
+	id[8] = (id[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", id[0:4], id[4:6], id[6:8], id[8:10], id[10:16]), nil
 }
 
 func parseCodexQuotaResponse(raw []byte) (pluginapi.QuotaFetchResponse, error) {
@@ -551,6 +932,13 @@ func parseCodexQuotaResponse(raw []byte) (pluginapi.QuotaFetchResponse, error) {
 	if credits := nestedMap(root, "credits"); len(credits) > 0 {
 		if balance, ok := numberField(credits, "balance"); ok {
 			response.Summary = append(response.Summary, pluginapi.QuotaMetric{Key: "credits_balance", Label: "Credits balance", Value: balance, Format: "number"})
+		}
+	}
+	if credits := nestedMap(root, "rate_limit_reset_credits"); len(credits) > 0 {
+		if count, ok := numberField(credits, "available_count", "availableCount"); ok {
+			response.Summary = append(response.Summary, pluginapi.QuotaMetric{
+				Key: "rate_limit_reset_credits_available", Label: "Quota reset credits available", Value: count, Format: "number",
+			})
 		}
 	}
 	return response, nil

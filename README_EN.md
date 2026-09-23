@@ -54,7 +54,31 @@ GET /v0/resource/plugins/user-routing/quota
 Authorization: Bearer <CPA downstream API key>
 ```
 
-The request key selects the nominal prefix from `prefix_map`. The plugin then queries Codex credentials for that prefix and the ordered successors in `quota_fallback.prefixes`. The response keeps only the entries matching the nominal and selected actual prefixes instead of returning the full `prefixes` list: `nominal_prefix` and `actual_prefix` identify the two prefixes, while `nominal_accounts` and `actual_accounts` are dictionaries keyed by credential email with quota results as values. Credential indexes, tokens, and raw auth JSON are never returned.
+The request key selects the nominal prefix from `prefix_map`. The plugin then queries Codex credentials for that prefix and the ordered successors in `quota_fallback.prefixes`. The response keeps only the entries matching the nominal and selected actual prefixes instead of returning the full `prefixes` list: `nominal_prefix` and `actual_prefix` identify the two prefixes, while `nominal_accounts` and `actual_accounts` are dictionaries keyed by credential email. Each account item includes the normalized quota fields and `reset_credits`: `available_count` is the number of available reset credits, `expires_at` lists expiry times for available credits with an expiry, `without_expiry` counts credits that do not expire, `expiry_details_available` indicates whether detailed expiry data was retrieved, and `expiry_details_complete` indicates whether the returned expiry details cover all available credits (the upstream may truncate the detail list). Credential indexes, tokens, credit IDs, and raw auth JSON are never returned.
+
+The plugin also implements CPA's native `QuotaProvider.ResetQuota`, which can consume one Codex reset credit for a single auth file through CPA's native Management API, protected by the Management Key:
+
+```text
+POST /v0/management/plugins/user-routing/quota/reset
+{"auth_index":"<CPA auth index>"}
+```
+
+After a successful reset, CPA also clears that auth file's local quota cooldown. This native reset endpoint requires the CPA Management Key.
+
+The plugin also provides a synchronous GET reset endpoint authenticated by the downstream API key:
+
+```text
+GET /v0/resource/plugins/user-routing/quota/reset
+Authorization: Bearer <CPA downstream API key>
+```
+
+It only processes enabled, available Codex auth files under the key's `nominal_prefix`; it does not follow `quota_fallback`. It makes at most one attempt to consume an available reset credit for each account, waits for all accounts to finish, and returns a `nominal_accounts` dictionary with per-account `success` and `message` values. It never retries automatically. This is a mutating GET request, so do not trigger it through browser prefetching, link previews, or automatic client retries. Because this public resource route calls Codex directly, it bypasses CPA's native Management API post-processing and does not clear CPA's local quota cooldown; use the native management endpoint above when local cooldown clearing is required. If the connection times out before the consumption result is returned, an account may already have been reset, but the plugin will not retry; query the remaining count first.
+
+Example successful response:
+
+```json
+{"nominal_prefix":"prefix1/","success":true,"partial":false,"nominal_accounts":{"account@example.com":{"success":true,"message":"Codex quota reset credit consumed"}}}
+```
 
 ```yaml
 quota_provider:
@@ -62,7 +86,7 @@ quota_provider:
   public_endpoint: true
 ```
 
-With `public_endpoint: false`, CPA's native `QuotaProvider` integration remains available, but the public resource route is not registered. Codex quota is read from ChatGPT/Codex's `/backend-api/wham/usage` endpoint; this is a private upstream endpoint and changes to its response format may make quota queries fail.
+With `public_endpoint: false`, CPA's native `QuotaProvider` integration remains available, but the public query and reset resource routes are not registered. Codex usage and reset-credit details are read from ChatGPT/Codex's `/backend-api/wham/usage` and `/backend-api/wham/rate-limit-reset-credits` endpoints; consumption calls the corresponding `/consume` endpoint. These upstream formats may change. See the [Codex upstream client implementation](https://github.com/openai/codex/blob/main/codex-rs/backend-client/src/client/rate_limit_resets.rs).
 
 Supported APIs/protocols:
 

@@ -54,7 +54,31 @@ GET /v0/resource/plugins/user-routing/quota
 Authorization: Bearer <CPA 下游 API Key>
 ```
 
-插件会读取请求 Key 对应的名义前缀，并按 `quota_fallback.prefixes` 依次查询后继前缀的 Codex 认证文件。响应只保留名义前缀和实际前缀对应的认证账户，不再返回完整的 `prefixes` 列表：`nominal_prefix` 与 `actual_prefix` 表示两种前缀，`nominal_accounts` 与 `actual_accounts` 是以认证账户邮箱为键、额度结果为值的字典。插件不会返回认证文件索引、令牌或原始认证 JSON。
+插件会读取请求 Key 对应的名义前缀，并按 `quota_fallback.prefixes` 依次查询后继前缀的 Codex 认证文件。响应只保留名义前缀和实际前缀对应的认证账户，不再返回完整的 `prefixes` 列表：`nominal_prefix` 与 `actual_prefix` 表示两种前缀，`nominal_accounts` 与 `actual_accounts` 是以认证账户邮箱为键的字典。每个账户项包含标准额度字段，以及 `reset_credits`：`available_count` 为剩余可用重置次数，`expires_at` 为已返回的可用重置次数对应的失效时间列表，`without_expiry` 为不设失效时间的次数，`expiry_details_available` 表示是否成功读取详细有效期，`expiry_details_complete` 表示上游返回的有效期明细是否覆盖全部可用次数（上游可能截断明细）。插件不会返回认证文件索引、令牌、credit ID 或原始认证 JSON。
+
+插件也实现了 CPA 原生 `QuotaProvider.ResetQuota`，可从 CPA 受 Management Key 保护的原生管理接口对单个认证文件消耗一次 Codex 重置额度，例如：
+
+```text
+POST /v0/management/plugins/user-routing/quota/reset
+{"auth_index":"<CPA auth index>"}
+```
+
+这会对指定认证文件执行一次消费；成功后 CPA 会同步清除该认证文件的本地额度冷却状态。此原生重置接口需要 CPA Management Key。
+
+插件另提供一个由下游 API Key 鉴权的同步 GET 重置接口：
+
+```text
+GET /v0/resource/plugins/user-routing/quota/reset
+Authorization: Bearer <CPA 下游 API Key>
+```
+
+该接口只处理此 Key 对应的 `nominal_prefix` 下启用且可用的 Codex 认证文件，不跟随 `quota_fallback`；对每个账户最多尝试消费一次可用重置额度，等待所有账户处理完后返回 `nominal_accounts` 字典及逐账户 `success`、`message`。不会自动重试。注意这是有副作用的 GET 请求，请勿由浏览器预取、链接预览或自动重试客户端触发。该公开资源路由直接调用 Codex 上游，成功后不会经过 CPA 原生 Management API 的后处理，因此不会清除 CPA 本地额度冷却状态；需要清除本地冷却时仍须使用上面的 CPA 原生管理接口。若连接在消费结果返回前超时，账户可能已被重置，但插件不会重试；请先重新查询剩余次数。
+
+成功时的响应示例：
+
+```json
+{"nominal_prefix":"prefix1/","success":true,"partial":false,"nominal_accounts":{"account@example.com":{"success":true,"message":"Codex quota reset credit consumed"}}}
+```
 
 ```yaml
 quota_provider:
@@ -62,7 +86,7 @@ quota_provider:
   public_endpoint: true
 ```
 
-`public_endpoint: false` 时仍保留 CPA 原生 `QuotaProvider` 能力，但不注册公开资源接口。Codex 额度通过 ChatGPT/Codex 的 `/backend-api/wham/usage` 读取；该上游接口属于非公开实现，接口格式变化可能导致查询失败。
+`public_endpoint: false` 时仍保留 CPA 原生 `QuotaProvider` 能力，但不注册公开查询和重置资源接口。Codex 用量和重置额度详情分别通过 ChatGPT/Codex 的 `/backend-api/wham/usage` 与 `/backend-api/wham/rate-limit-reset-credits` 读取，消费则调用对应的 `/consume` 接口；这些上游接口格式可能变化。[Codex 上游客户端实现](https://github.com/openai/codex/blob/main/codex-rs/backend-client/src/client/rate_limit_resets.rs)
 
 支持的 API/协议：
 
