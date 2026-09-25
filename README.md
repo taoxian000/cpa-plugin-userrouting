@@ -54,7 +54,17 @@ GET /v0/resource/plugins/user-routing/quota
 Authorization: Bearer <CPA 下游 API Key>
 ```
 
-插件会读取请求 Key 对应的名义前缀，并按 `quota_fallback.prefixes` 依次查询后继前缀的 Codex 认证文件。响应只保留名义前缀和实际前缀对应的认证账户，不再返回完整的 `prefixes` 列表：`nominal_prefix` 与 `actual_prefix` 表示两种前缀，`nominal_accounts` 与 `actual_accounts` 是以认证账户邮箱为键的字典。每个账户项包含标准额度字段，以及 `reset_credits`：`available_count` 为剩余可用重置次数，`expires_at` 为已返回的可用重置次数对应的失效时间列表，`without_expiry` 为不设失效时间的次数，`expiry_details_available` 表示是否成功读取详细有效期，`expiry_details_complete` 表示上游返回的有效期明细是否覆盖全部可用次数（上游可能截断明细）。插件不会返回认证文件索引、令牌、credit ID 或原始认证 JSON。
+插件会读取请求 Key 对应的名义前缀，并按 `quota_fallback.prefixes` 依次查询后继前缀的 Codex 认证文件；找到首个仍有额度的前缀后即停止查询。响应只保留名义前缀和实际前缀对应的认证账户，不再返回完整的 `prefixes` 列表：`nominal_prefix` 与 `actual_prefix` 表示两种前缀，`nominal_accounts` 与 `actual_accounts` 是以认证账户邮箱为键的字典。如果名义前缀本身仍有额度，`actual_prefix` 仍返回名义前缀，但省略重复的 `actual_accounts`。每个账户项包含标准额度字段，以及 `reset_credits`：`available_count` 为剩余可用重置次数，`expires_at` 为已返回的可用重置次数对应的失效时间列表，`without_expiry` 为不设失效时间的次数，`expiry_details_available` 表示是否成功读取详细有效期，`expiry_details_complete` 表示上游返回的有效期明细是否覆盖全部可用次数（上游可能截断明细）。插件不会返回认证文件索引、令牌、credit ID 或原始认证 JSON。额度用量与重置额度的只读查询失败时会重试 3 次（最多 4 次尝试）；重置次数的实际消费请求不会重试。
+
+也可直接用 Codex 标准认证信息查询单个账户，无需 CPA 下游 API Key，也不查前缀或 CPA 认证文件：
+
+```text
+GET /v0/resource/plugins/user-routing/quota/direct
+Authorization: Bearer <Codex tokens.access_token>
+ChatGPT-Account-ID: <Codex tokens.account_id>
+```
+
+响应使用 `accounts` 字典，键为 access token 中的账户邮箱（无法读取时使用 account ID；邮箱仅用于结果标识，凭据有效性由上游验证），值的额度字段与上面的账户项相同；此路由不返回任何前缀字段。`base_url`、`id_token` 和 `refresh_token` 不需要传入，查询使用默认 Codex 地址。此路由不验证 CPA 下游 Key，持有有效 Codex access token 的请求即可直接查询；请使用 HTTPS，不要把 token 放入 URL，并确保代理及应用日志不会记录 `Authorization`。用量和重置额度详情的只读查询失败时最多重试 3 次。
 
 插件也实现了 CPA 原生 `QuotaProvider.ResetQuota`，可从 CPA 受 Management Key 保护的原生管理接口对单个认证文件消耗一次 Codex 重置额度，例如：
 
@@ -72,7 +82,7 @@ GET /v0/resource/plugins/user-routing/quota/reset
 Authorization: Bearer <CPA 下游 API Key>
 ```
 
-该接口只处理此 Key 对应的 `nominal_prefix` 下启用且可用的 Codex 认证文件，不跟随 `quota_fallback`；对每个账户最多尝试消费一次可用重置额度，等待所有账户处理完后返回 `nominal_accounts` 字典及逐账户 `success`、`message`。不会自动重试。注意这是有副作用的 GET 请求，请勿由浏览器预取、链接预览或自动重试客户端触发。该公开资源路由直接调用 Codex 上游，成功后不会经过 CPA 原生 Management API 的后处理，因此不会清除 CPA 本地额度冷却状态；需要清除本地冷却时仍须使用上面的 CPA 原生管理接口。若连接在消费结果返回前超时，账户可能已被重置，但插件不会重试；请先重新查询剩余次数。
+该接口只处理此 Key 对应的 `nominal_prefix` 下启用且可用的 Codex 认证文件，不跟随 `quota_fallback`；对每个账户最多尝试消费一次可用重置额度，等待所有账户处理完后返回 `nominal_accounts` 字典及逐账户 `success`、`message`。实际消费请求不会自动重试；前置的只读额度查询仍按上文规则最多重试 3 次。注意这是有副作用的 GET 请求，请勿由浏览器预取、链接预览或自动重试客户端触发。该公开资源路由直接调用 Codex 上游，成功后不会经过 CPA 原生 Management API 的后处理，因此不会清除 CPA 本地额度冷却状态；需要清除本地冷却时仍须使用上面的 CPA 原生管理接口。若连接在消费结果返回前超时，账户可能已被重置，但插件不会重试；请先重新查询剩余次数。
 
 成功时的响应示例：
 
@@ -185,7 +195,7 @@ prefix_map: '{"apikey_1":"prefix_1/","apikey_2":"prefix_2/","default":""}'
 | `quota_fallback.fallback_on_other_errors` | `false` | 是否也在其他上游错误时进行跨前缀模型回退；流式请求仅在输出首个内容前回退 |
 | `quota_fallback.prefixes` | 空 | 源前缀到按顺序尝试的目标前缀列表 |
 | `quota_provider.enabled` | `true` | 是否注册 Codex `QuotaProvider` |
-| `quota_provider.public_endpoint` | `true` | 是否注册无需 Management Key、但要求下游 API Key 的额度查询资源接口 |
+| `quota_provider.public_endpoint` | `true` | 是否注册公开额度查询/重置资源接口：按前缀查询的接口要求下游 API Key，`/quota/direct` 则直接接受 Codex access token |
 | `strict_key_validation` | `true` | 映射中出现不在 CPA `api-keys` 内的 Key 时拒绝加载 |
 | `models_url` | 自动推导 | CPA `/v1/models` 的绝对地址 |
 | `model_cache_ttl` | `5s` | 模型目录缓存时间，`0s` 表示不缓存 |

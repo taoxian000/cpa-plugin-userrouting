@@ -47,14 +47,24 @@ The list is applied for one level only and in the specified order. By default, o
 
 ### Codex quota queries
 
-The plugin implements CPA's `QuotaProvider` capability for Codex. This requires CPA v7.3.9 or later, which includes the `QuotaProvider` ABI. It also registers a public resource endpoint that does not require the CPA Management Key, but does require a valid downstream CPA API key:
+The plugin implements CPA's `QuotaProvider` capability for Codex. This requires CPA v7.3.9 or later, which includes the `QuotaProvider` ABI. It also registers public resource endpoints without the CPA Management Key: the prefix-based query and reset endpoints require a valid downstream CPA API key, while `/quota/direct` accepts a Codex access token directly.
 
 ```text
 GET /v0/resource/plugins/user-routing/quota
 Authorization: Bearer <CPA downstream API key>
 ```
 
-The request key selects the nominal prefix from `prefix_map`. The plugin then queries Codex credentials for that prefix and the ordered successors in `quota_fallback.prefixes`. The response keeps only the entries matching the nominal and selected actual prefixes instead of returning the full `prefixes` list: `nominal_prefix` and `actual_prefix` identify the two prefixes, while `nominal_accounts` and `actual_accounts` are dictionaries keyed by credential email. Each account item includes the normalized quota fields and `reset_credits`: `available_count` is the number of available reset credits, `expires_at` lists expiry times for available credits with an expiry, `without_expiry` counts credits that do not expire, `expiry_details_available` indicates whether detailed expiry data was retrieved, and `expiry_details_complete` indicates whether the returned expiry details cover all available credits (the upstream may truncate the detail list). Credential indexes, tokens, credit IDs, and raw auth JSON are never returned.
+The request key selects the nominal prefix from `prefix_map`. The plugin queries Codex credentials for that prefix and the ordered successors in `quota_fallback.prefixes`, stopping at the first prefix with remaining quota. The response keeps only the nominal and selected actual prefix entries instead of returning the full `prefixes` list: `nominal_prefix` and `actual_prefix` identify the two prefixes, while `nominal_accounts` and `actual_accounts` are dictionaries keyed by credential email. If the nominal prefix still has quota, `actual_prefix` remains the nominal prefix and the duplicate `actual_accounts` field is omitted. Each account item includes the normalized quota fields and `reset_credits`: `available_count` is the number of available reset credits, `expires_at` lists expiry times for available credits with an expiry, `without_expiry` counts credits that do not expire, `expiry_details_available` indicates whether detailed expiry data was retrieved, and `expiry_details_complete` indicates whether the returned expiry details cover all available credits (the upstream may truncate the detail list). Credential indexes, tokens, credit IDs, and raw auth JSON are never returned. Read-only usage and reset-credit queries retry up to three times (four attempts total); reset-credit consumption is never retried.
+
+You can also query one account directly using the required parts of a standard Codex auth file, without a downstream CPA API key, prefix lookup, or CPA auth-file lookup:
+
+```text
+GET /v0/resource/plugins/user-routing/quota/direct
+Authorization: Bearer <Codex tokens.access_token>
+ChatGPT-Account-ID: <Codex tokens.account_id>
+```
+
+The response contains an `accounts` dictionary keyed by the email claim in the access token (falling back to the account ID), with the same quota fields as above. The email is only a display label; the upstream validates the credential. This route returns no prefix fields. `base_url`, `id_token`, and `refresh_token` are not required; the default Codex endpoint is used. The route does not validate a CPA downstream key: anyone presenting a valid Codex access token can query its quota. Use HTTPS, never put the token in the URL, and ensure that proxies and application logs redact `Authorization`. Read-only usage and reset-credit detail queries retry up to three times.
 
 The plugin also implements CPA's native `QuotaProvider.ResetQuota`, which can consume one Codex reset credit for a single auth file through CPA's native Management API, protected by the Management Key:
 
@@ -72,7 +82,7 @@ GET /v0/resource/plugins/user-routing/quota/reset
 Authorization: Bearer <CPA downstream API key>
 ```
 
-It only processes enabled, available Codex auth files under the key's `nominal_prefix`; it does not follow `quota_fallback`. It makes at most one attempt to consume an available reset credit for each account, waits for all accounts to finish, and returns a `nominal_accounts` dictionary with per-account `success` and `message` values. It never retries automatically. This is a mutating GET request, so do not trigger it through browser prefetching, link previews, or automatic client retries. Because this public resource route calls Codex directly, it bypasses CPA's native Management API post-processing and does not clear CPA's local quota cooldown; use the native management endpoint above when local cooldown clearing is required. If the connection times out before the consumption result is returned, an account may already have been reset, but the plugin will not retry; query the remaining count first.
+It only processes enabled, available Codex auth files under the key's `nominal_prefix`; it does not follow `quota_fallback`. It makes at most one attempt to consume an available reset credit for each account, waits for all accounts to finish, and returns a `nominal_accounts` dictionary with per-account `success` and `message` values. The mutating consumption request is never retried; its preceding read-only quota checks follow the three-retry policy above. This is a mutating GET request, so do not trigger it through browser prefetching, link previews, or automatic client retries. Because this public resource route calls Codex directly, it bypasses CPA's native Management API post-processing and does not clear CPA's local quota cooldown; use the native management endpoint above when local cooldown clearing is required. If the connection times out before the consumption result is returned, an account may already have been reset, but the plugin will not retry; query the remaining count first.
 
 Example successful response:
 
@@ -185,7 +195,7 @@ Non-empty prefixes are normalized to end with `/`, so `prefix_1` and `prefix_1/`
 | `quota_fallback.fallback_on_other_errors` | `false` | Also perform cross-prefix fallback for other upstream errors; streaming requests only fall back before their first emitted payload. |
 | `quota_fallback.prefixes` | Empty | Mapping from source prefixes to target prefixes to attempt in order. |
 | `quota_provider.enabled` | `true` | Register the Codex `QuotaProvider`. |
-| `quota_provider.public_endpoint` | `true` | Register the quota resource route without the Management Key while requiring a downstream API key. |
+| `quota_provider.public_endpoint` | `true` | Register public quota resource routes without the Management Key; the prefix-based route requires a downstream API key, while `/quota/direct` accepts a Codex access token directly. |
 | `strict_key_validation` | `true` | Reject configuration when a mapped key does not exist in CPA's `api-keys`. |
 | `models_url` | Auto-derived | Absolute URL of CPA's `/v1/models` endpoint. |
 | `model_cache_ttl` | `5s` | Model catalog cache lifetime; `0s` disables caching. |

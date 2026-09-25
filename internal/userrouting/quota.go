@@ -3,6 +3,7 @@ package userrouting
 import (
 	"context"
 	cryptorand "crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,8 +21,11 @@ const (
 	quotaProviderIdentifier = "user-routing-quota"
 	quotaProviderName       = "Codex quota"
 	quotaResourcePath       = "/quota"
+	quotaDirectResourcePath = "/quota/direct"
 	quotaResetResourcePath  = "/quota/reset"
 	quotaCodexProvider      = "codex"
+	quotaQueryRetryCount    = 3
+	quotaQueryRetryDelay    = 100 * time.Millisecond
 )
 
 // QuotaProviderIdentifier returns the stable plugin quota capability ID used
@@ -51,6 +55,10 @@ type rpcHostHTTPRequest struct {
 type quotaHTTPClient struct {
 	host       HostCaller
 	callbackID string
+}
+
+type quotaHTTPDoer interface {
+	Do(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error)
 }
 
 func (c *quotaHTTPClient) Do(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
@@ -144,13 +152,9 @@ func (r *Runtime) ResetQuota(ctx context.Context, req pluginapi.QuotaResetReques
 		return pluginapi.QuotaResetResponse{Message: "invalid Codex base URL"}
 	}
 	headers := codexRequestHeaders(accessToken, accountID)
-	creditsResponse, err := req.HTTPClient.Do(ctx, pluginapi.HTTPRequest{Method: http.MethodGet, URL: creditsURL, Headers: headers})
-	if err != nil || creditsResponse.StatusCode < http.StatusOK || creditsResponse.StatusCode >= http.StatusMultipleChoices {
-		return pluginapi.QuotaResetResponse{Message: "unable to check Codex reset-credit availability"}
-	}
-	credits, err := parseCodexResetCredits(creditsResponse.Body, nil)
+	creditsResponse, credits, err := readCodexResetCreditsWithRetry(ctx, req.HTTPClient, creditsURL, headers, nil)
 	if err != nil {
-		return pluginapi.QuotaResetResponse{Message: "invalid Codex reset-credit response"}
+		return pluginapi.QuotaResetResponse{Message: "unable to check Codex reset-credit availability"}
 	}
 	if credits.AvailableCount < 1 {
 		return pluginapi.QuotaResetResponse{Message: "no Codex quota reset credits are available"}
@@ -227,6 +231,15 @@ type quotaResourceResponse struct {
 	Partial         bool                            `json:"partial"`
 }
 
+// quotaDirectResourceResponse is returned by the token-forwarding resource.
+// It intentionally has no prefix fields because the route performs no prefix
+// lookup and accepts no downstream CPA API key.
+type quotaDirectResourceResponse struct {
+	Accounts map[string]quotaResourceAccount `json:"accounts,omitempty"`
+	Errors   []string                        `json:"errors,omitempty"`
+	Partial  bool                            `json:"partial"`
+}
+
 type quotaPrefixResult struct {
 	Prefix   string
 	Accounts map[string]quotaResourceAccount
@@ -257,6 +270,10 @@ func (r *Runtime) RegisterManagement() pluginapi.ManagementRegistrationResponse 
 				Description: "Query Codex quota using a downstream CPA API key.",
 			},
 			{
+				Path:        quotaDirectResourcePath,
+				Description: "Query Codex quota by forwarding a caller-supplied Codex access token.",
+			},
+			{
 				Path:        quotaResetResourcePath,
 				Description: "Synchronously consume one available Codex quota reset credit for every account under a downstream key's nominal prefix.",
 			},
@@ -264,15 +281,18 @@ func (r *Runtime) RegisterManagement() pluginapi.ManagementRegistrationResponse 
 	}
 }
 
-// HandleManagement handles the public ResourceRoute. Resource routes are not
-// protected by CPA's Management Key, so the downstream CPA API key is checked
-// against the native api-keys list before any auth material is read.
+// HandleManagement handles the public ResourceRoute. The normal quota and
+// reset routes require a downstream CPA API key; the direct route accepts a
+// Codex access token and deliberately bypasses CPA key and prefix lookup.
 func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.ManagementRequest, callbackID string) (pluginapi.ManagementResponse, error) {
 	if r == nil || !r.config.Enabled || !r.config.QuotaProvider.Enabled || !r.config.QuotaProvider.PublicEndpoint {
 		return quotaJSONResponse(http.StatusNotFound, map[string]string{"error": "quota resource is disabled"}), nil
 	}
 	if req.Method != "" && !strings.EqualFold(req.Method, http.MethodGet) {
 		return quotaJSONResponse(http.StatusMethodNotAllowed, map[string]string{"error": "GET is required"}), nil
+	}
+	if isQuotaDirectResourcePath(req.Path) {
+		return r.handleQuotaDirectResource(ctx, req.Headers, callbackID), nil
 	}
 	snapshot, err := r.config.CPAConfig.Snapshot()
 	if err != nil {
@@ -311,7 +331,6 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 
 	nominalPrefix = normalizePrefix(nominalName)
 	prefixResults := make([]quotaPrefixResult, 0, len(candidates))
-	actualSet := false
 	actualPrefix := nominalPrefix
 	for _, candidate := range candidates {
 		prefixResult := quotaPrefixResult{
@@ -367,11 +386,14 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 			}
 			prefixResult.Accounts[account] = quotaResourceAccount{QuotaFetchResponse: quota, ResetCredits: resetCredits}
 		}
-		if !actualSet && quotaPrefixHasRemaining(prefixResult) {
+		selected := quotaPrefixHasRemaining(prefixResult)
+		if selected {
 			actualPrefix = prefixResult.Prefix
-			actualSet = true
 		}
 		prefixResults = append(prefixResults, prefixResult)
+		if selected {
+			break
+		}
 	}
 	if len(prefixResults) == 0 {
 		return quotaJSONResponse(http.StatusNotFound, map[string]string{"error": "no Codex credential matches the configured prefix"}), nil
@@ -380,7 +402,9 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 		NominalPrefix:   nominalPrefix,
 		ActualPrefix:    actualPrefix,
 		NominalAccounts: make(map[string]quotaResourceAccount),
-		ActualAccounts:  make(map[string]quotaResourceAccount),
+	}
+	if actualPrefix != nominalPrefix {
+		result.ActualAccounts = make(map[string]quotaResourceAccount)
 	}
 	matched := false
 	for _, prefix := range prefixResults {
@@ -399,7 +423,7 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 				result.NominalAccounts[account] = quota
 			}
 		}
-		if prefix.Prefix == actualPrefix {
+		if actualPrefix != nominalPrefix && prefix.Prefix == actualPrefix {
 			for account, quota := range prefix.Accounts {
 				result.ActualAccounts[account] = quota
 			}
@@ -411,14 +435,92 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 	return quotaJSONResponse(http.StatusOK, result), nil
 }
 
+func isQuotaDirectResourcePath(path string) bool {
+	path = "/" + strings.Trim(strings.TrimSpace(path), "/")
+	return path == quotaDirectResourcePath || strings.HasSuffix(path, "/plugins/user-routing"+quotaDirectResourcePath)
+}
+
+func (r *Runtime) handleQuotaDirectResource(ctx context.Context, headers http.Header, callbackID string) pluginapi.ManagementResponse {
+	accessToken := extractBearerToken(headers.Get("Authorization"))
+	if accessToken == "" {
+		accessToken = extractBearerToken(headers.Get("X-Codex-Access-Token"))
+	}
+	if accessToken == "" {
+		return quotaJSONResponse(http.StatusBadRequest, map[string]string{"error": "a Codex access token is required"})
+	}
+
+	emailFromToken, accountIDFromToken := codexTokenDisplayClaims(accessToken)
+	accountID := strings.TrimSpace(headers.Get("ChatGPT-Account-ID"))
+	if accountID == "" {
+		accountID = strings.TrimSpace(headers.Get("X-Codex-Account-ID"))
+	}
+	if accountID == "" {
+		accountID = accountIDFromToken
+	}
+	if accountID == "" {
+		return quotaJSONResponse(http.StatusBadRequest, map[string]string{"error": "a Codex account ID is required"})
+	}
+
+	storageJSON, err := json.Marshal(map[string]string{"access_token": accessToken, "account_id": accountID})
+	if err != nil {
+		return quotaJSONResponse(http.StatusInternalServerError, map[string]string{"error": "could not prepare Codex credentials"})
+	}
+	quotaRequest := pluginapi.QuotaFetchRequest{
+		Provider:    quotaCodexProvider,
+		StorageJSON: storageJSON,
+		HTTPClient:  &quotaHTTPClient{host: r.host, callbackID: callbackID},
+	}
+	quota, err := r.FetchQuota(ctx, quotaRequest, callbackID)
+	if err != nil {
+		return quotaJSONResponse(http.StatusBadGateway, map[string]string{"error": "Codex quota query failed after 3 retries"})
+	}
+	resetCredits, err := fetchCodexResetCreditInfo(ctx, quotaRequest, quota)
+	result := quotaDirectResourceResponse{Accounts: make(map[string]quotaResourceAccount, 1)}
+	if err != nil {
+		result.Partial = true
+		result.Errors = append(result.Errors, "Codex reset-credit details query failed after 3 retries")
+		resetCredits = quotaResetCreditInfoFromQuota(quota)
+	}
+	account := emailFromToken
+	if account == "" {
+		account = accountID
+	}
+	result.Accounts[account] = quotaResourceAccount{QuotaFetchResponse: quota, ResetCredits: resetCredits}
+	return quotaJSONResponse(http.StatusOK, result)
+}
+
+// codexTokenDisplayClaims decodes claims only to label the returned account.
+// It does not authorize the request; the upstream quota API validates the
+// supplied bearer token when the query is made.
+func codexTokenDisplayClaims(accessToken string) (email, accountID string) {
+	parts := strings.Split(accessToken, ".")
+	if len(parts) < 2 {
+		return "", ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", ""
+	}
+	var claims struct {
+		Profile map[string]any `json:"https://api.openai.com/profile"`
+		Auth    map[string]any `json:"https://api.openai.com/auth"`
+	}
+	if json.Unmarshal(payload, &claims) != nil {
+		return "", ""
+	}
+	email, _ = claims.Profile["email"].(string)
+	accountID, _ = claims.Auth["chatgpt_account_id"].(string)
+	return strings.TrimSpace(email), strings.TrimSpace(accountID)
+}
+
 func isQuotaResetResourcePath(path string) bool {
 	path = "/" + strings.Trim(strings.TrimSpace(path), "/")
 	return path == quotaResetResourcePath || strings.HasSuffix(path, "/plugins/user-routing"+quotaResetResourcePath)
 }
 
 // handleQuotaResetResource runs synchronously and only targets Codex auth files
-// whose nominal prefix matches the downstream API key. Each account gets one
-// attempt; failures are returned to the caller and are never retried.
+// whose nominal prefix matches the downstream API key. The read-only quota
+// checks may retry; each mutating reset-consumption request is attempted once.
 func (r *Runtime) handleQuotaResetResource(ctx context.Context, nominalName string, files []pluginapi.HostAuthFileEntry, callbackID string) pluginapi.ManagementResponse {
 	nominalPrefix := normalizePrefix(nominalName)
 	result := quotaResetResourceResponse{
@@ -647,6 +749,12 @@ func stringMapValue(root map[string]any, key string) map[string]string {
 }
 
 func fetchCodexQuota(ctx context.Context, req pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+	return retryQuotaRead(ctx, func() (pluginapi.QuotaFetchResponse, error) {
+		return fetchCodexQuotaOnce(ctx, req)
+	})
+}
+
+func fetchCodexQuotaOnce(ctx context.Context, req pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
 	if req.HTTPClient == nil {
 		return pluginapi.QuotaFetchResponse{}, errors.New("quota HTTP client is unavailable")
 	}
@@ -666,6 +774,37 @@ func fetchCodexQuota(ctx context.Context, req pluginapi.QuotaFetchRequest) (plug
 		return pluginapi.QuotaFetchResponse{}, fmt.Errorf("Codex quota endpoint returned HTTP %d", response.StatusCode)
 	}
 	return parseCodexQuotaResponse(response.Body)
+}
+
+func retryQuotaRead[T any](ctx context.Context, query func() (T, error)) (T, error) {
+	var zero T
+	var lastErr error
+	for attempt := 0; attempt <= quotaQueryRetryCount; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return zero, err
+		}
+		result, err := query()
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if attempt == quotaQueryRetryCount {
+			break
+		}
+		timer := time.NewTimer(quotaQueryRetryDelay * time.Duration(1<<attempt))
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return zero, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return zero, lastErr
 }
 
 func codexRequestCredentials(storageJSON []byte, metadata map[string]any, attributes map[string]string) (accessToken, accountID, baseURL string, err error) {
@@ -778,14 +917,39 @@ func fetchCodexResetCreditInfo(ctx context.Context, req pluginapi.QuotaFetchRequ
 	if err != nil {
 		return fallback, err
 	}
-	response, err := req.HTTPClient.Do(ctx, pluginapi.HTTPRequest{Method: http.MethodGet, URL: creditsURL, Headers: codexRequestHeaders(accessToken, accountID)})
+	_, info, err := readCodexResetCreditsWithRetry(ctx, req.HTTPClient, creditsURL, codexRequestHeaders(accessToken, accountID), quotaResetCreditsCount(quota))
 	if err != nil {
 		return fallback, err
 	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return fallback, fmt.Errorf("Codex reset-credit endpoint returned HTTP %d", response.StatusCode)
+	return info, nil
+}
+
+func readCodexResetCreditsWithRetry(ctx context.Context, client quotaHTTPDoer, creditsURL string, headers http.Header, fallbackCount *int) (pluginapi.HTTPResponse, quotaResetCreditInfo, error) {
+	type readResult struct {
+		response pluginapi.HTTPResponse
+		credits  quotaResetCreditInfo
 	}
-	return parseCodexResetCredits(response.Body, quotaResetCreditsCount(quota))
+	result, err := retryQuotaRead(ctx, func() (readResult, error) {
+		if client == nil {
+			return readResult{}, errors.New("quota HTTP client is unavailable")
+		}
+		response, err := client.Do(ctx, pluginapi.HTTPRequest{Method: http.MethodGet, URL: creditsURL, Headers: headers})
+		if err != nil {
+			return readResult{}, err
+		}
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			return readResult{}, fmt.Errorf("Codex reset-credit endpoint returned HTTP %d", response.StatusCode)
+		}
+		credits, err := parseCodexResetCredits(response.Body, fallbackCount)
+		if err != nil {
+			return readResult{}, err
+		}
+		return readResult{response: response, credits: credits}, nil
+	})
+	if err != nil {
+		return pluginapi.HTTPResponse{}, quotaResetCreditInfo{}, err
+	}
+	return result.response, result.credits, nil
 }
 
 func parseCodexResetCredits(raw []byte, fallbackCount *int) (quotaResetCreditInfo, error) {

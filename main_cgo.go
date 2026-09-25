@@ -374,7 +374,7 @@ func pluginRegistration(runtime *userrouting.Runtime) registration {
 				{Name: "register_deduplicated_models", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Register additional deduplicated unprefixed models in CPA's model catalog."},
 				{Name: "include_default_prefix", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Include the reserved default prefix when building the deduplication prefix list."},
 				{Name: "quota_fallback", Type: pluginapi.ConfigFieldTypeObject, Description: "Optional ordered cross-prefix fallback. Set fallback_on_other_errors to retry other upstream errors too."},
-				{Name: "quota_provider", Type: pluginapi.ConfigFieldTypeObject, Description: "Register the Codex quota provider and downstream API-key quota query/reset resource endpoints."},
+				{Name: "quota_provider", Type: pluginapi.ConfigFieldTypeObject, Description: "Register the Codex quota provider and public quota resources; the direct query route accepts a Codex access token without a downstream API key."},
 				{Name: "strict_key_validation", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Reject mapped keys that are not present in CPA api-keys."},
 				{Name: "models_url", Type: pluginapi.ConfigFieldTypeString, Description: "Optional absolute CPA /v1/models URL; normally derived from config.yaml."},
 				{Name: "model_cache_ttl", Type: pluginapi.ConfigFieldTypeString, Description: "How long to cache the CPA model catalog, for example 5s."},

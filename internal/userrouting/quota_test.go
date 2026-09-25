@@ -2,6 +2,7 @@ package userrouting
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -157,6 +158,125 @@ func TestQuotaResourceReturnsNominalAndActualPrefixes(t *testing.T) {
 	}
 }
 
+func TestQuotaResourceOmitsActualAccountsWhenNominalPrefixHasQuota(t *testing.T) {
+	path := writeCPAConfig(t, "key-1")
+	host := &quotaResourceHost{
+		auths: map[string]quotaTestAuth{
+			"auth-1": {prefix: "prefix1", email: "one@example.com", token: "token-1", remaining: 0.5},
+			"auth-2": {prefix: "prefix2", email: "two@example.com", token: "token-2", remaining: 0.8},
+		},
+	}
+	runtime := &Runtime{host: host, config: runtimeConfig{
+		Enabled:       true,
+		PrefixMap:     PrefixMap{"key-1": "prefix1/", "default": ""},
+		QuotaFallback: quotaFallbackConfig{Enabled: true, Prefixes: map[string][]string{"prefix1": {"prefix2"}}},
+		QuotaProvider: quotaProviderConfig{Enabled: true, PublicEndpoint: true},
+		CPAConfig:     NewCPAConfigReader(path),
+	}}
+	response, err := runtime.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method:  http.MethodGet,
+		Headers: bearerHeader("key-1"),
+		Path:    "/v0/resource/plugins/user-routing/quota",
+	}, "callback-1")
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("HandleManagement() = (%#v, %v), want 200", response, err)
+	}
+	var decoded quotaResourceResponse
+	if err := json.Unmarshal(response.Body, &decoded); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if decoded.NominalPrefix != "prefix1/" || decoded.ActualPrefix != "prefix1/" || decoded.ActualAccounts != nil {
+		t.Fatalf("response = %#v, want unchanged prefix fields and no actual_accounts", decoded)
+	}
+	if host.usageCalls != 1 || host.resetCreditsCalls != 1 {
+		t.Fatalf("query counts = usage %d, reset credits %d; fallback account should not be queried", host.usageCalls, host.resetCreditsCalls)
+	}
+	if strings.Contains(string(response.Body), `"actual_accounts"`) {
+		t.Fatalf("response contains duplicate actual accounts: %s", response.Body)
+	}
+}
+
+func TestDirectQuotaResourceForwardsTokenWithoutCPAKeyOrPrefixLookup(t *testing.T) {
+	token := testCodexAccessToken("direct@example.com", "account-direct")
+	host := &quotaResourceHost{}
+	runtime := &Runtime{host: host, config: runtimeConfig{
+		Enabled:       true,
+		QuotaProvider: quotaProviderConfig{Enabled: true, PublicEndpoint: true},
+	}}
+	registered := runtime.RegisterManagement()
+	if len(registered.Resources) != 3 || registered.Resources[1].Path != quotaDirectResourcePath {
+		t.Fatalf("registered resources = %#v, want direct quota route", registered.Resources)
+	}
+	response, err := runtime.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   "/v0/resource/plugins/user-routing/quota/direct",
+		Headers: http.Header{
+			"Authorization":      []string{"Bearer " + token},
+			"ChatGPT-Account-Id": []string{"account-direct"},
+		},
+	}, "callback-1")
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("HandleManagement() = (%#v, %v), want 200", response, err)
+	}
+	var decoded quotaDirectResourceResponse
+	if err := json.Unmarshal(response.Body, &decoded); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if _, ok := decoded.Accounts["direct@example.com"]; !ok || decoded.Partial {
+		t.Fatalf("direct response = %#v, body=%s", decoded, response.Body)
+	}
+	if strings.Contains(string(response.Body), "prefix") || strings.Contains(string(response.Body), "actual_accounts") || strings.Contains(string(response.Body), token) {
+		t.Fatalf("direct response contains prefix/account routing data or credential: %s", response.Body)
+	}
+	if host.authListCalls != 0 || host.authGetCalls != 0 || host.usageCalls != 1 || host.resetCreditsCalls != 1 {
+		t.Fatalf("host calls = auth-list %d, auth-get %d, usage %d, reset credits %d", host.authListCalls, host.authGetCalls, host.usageCalls, host.resetCreditsCalls)
+	}
+}
+
+func TestQuotaReadsRetryThreeTimes(t *testing.T) {
+	storage, _ := json.Marshal(map[string]string{"access_token": "retry-token", "account_id": "retry-account"})
+	host := &quotaResourceHost{usageFailures: 3, resetCreditsFailures: 3}
+	client := &quotaHTTPClient{host: host, callbackID: "callback-1"}
+	quota, err := fetchCodexQuota(context.Background(), pluginapi.QuotaFetchRequest{StorageJSON: storage, HTTPClient: client})
+	if err != nil {
+		t.Fatalf("fetchCodexQuota() error = %v", err)
+	}
+	if host.usageCalls != 4 {
+		t.Fatalf("usage attempts = %d, want initial attempt plus 3 retries", host.usageCalls)
+	}
+	_, err = fetchCodexResetCreditInfo(context.Background(), pluginapi.QuotaFetchRequest{StorageJSON: storage, HTTPClient: client}, quota)
+	if err != nil {
+		t.Fatalf("fetchCodexResetCreditInfo() error = %v", err)
+	}
+	if host.resetCreditsCalls != 4 {
+		t.Fatalf("reset-credit attempts = %d, want initial attempt plus 3 retries", host.resetCreditsCalls)
+	}
+}
+
+func TestQuotaReadStopsAfterThreeRetriesAndResetConsumptionIsNotRetried(t *testing.T) {
+	storage, _ := json.Marshal(map[string]string{"access_token": "retry-token", "account_id": "retry-account"})
+	host := &quotaResourceHost{usageFailures: quotaQueryRetryCount + 1}
+	_, err := fetchCodexQuota(context.Background(), pluginapi.QuotaFetchRequest{StorageJSON: storage, HTTPClient: &quotaHTTPClient{host: host}})
+	if err == nil || host.usageCalls != quotaQueryRetryCount+1 {
+		t.Fatalf("fetchCodexQuota() error=%v attempts=%d, want failure after 4 attempts", err, host.usageCalls)
+	}
+
+	host = &quotaResourceHost{consumeFailures: 1}
+	runtime := &Runtime{host: host, config: runtimeConfig{Enabled: true, QuotaProvider: quotaProviderConfig{Enabled: true}}}
+	reset := runtime.ResetQuota(context.Background(), pluginapi.QuotaResetRequest{Provider: quotaCodexProvider, StorageJSON: storage}, "callback-1")
+	if reset.Success || host.consumeCalls != 1 {
+		t.Fatalf("ResetQuota() = %#v, consume attempts=%d, want one non-retried consume", reset, host.consumeCalls)
+	}
+}
+
+func testCodexAccessToken(email, accountID string) string {
+	payload, _ := json.Marshal(map[string]any{
+		"https://api.openai.com/profile": map[string]any{"email": email},
+		"https://api.openai.com/auth":    map[string]any{"chatgpt_account_id": accountID},
+	})
+	return "header." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
+}
+
 func TestQuotaResetResourceSynchronouslyResetsOnlyNominalAccounts(t *testing.T) {
 	path := writeCPAConfig(t, "key-1")
 	host := &quotaResourceHost{
@@ -176,8 +296,8 @@ func TestQuotaResetResourceSynchronouslyResetsOnlyNominalAccounts(t *testing.T) 
 	}}
 
 	registered := runtime.RegisterManagement()
-	if len(registered.Resources) != 2 || registered.Resources[1].Path != quotaResetResourcePath {
-		t.Fatalf("registered resources = %#v, want quota query and reset routes", registered.Resources)
+	if len(registered.Resources) != 3 || registered.Resources[2].Path != quotaResetResourcePath {
+		t.Fatalf("registered resources = %#v, want quota, direct quota, and reset routes", registered.Resources)
 	}
 	response, err := runtime.HandleManagement(context.Background(), pluginapi.ManagementRequest{
 		Method:  http.MethodGet,
@@ -279,22 +399,31 @@ type quotaTestAuth struct {
 }
 
 type quotaResourceHost struct {
-	auths         map[string]quotaTestAuth
-	consumeCalls  int
-	consumeBody   []byte
-	consumeTokens []string
-	noCredits     bool
+	auths                map[string]quotaTestAuth
+	authListCalls        int
+	authGetCalls         int
+	usageCalls           int
+	usageFailures        int
+	resetCreditsCalls    int
+	resetCreditsFailures int
+	consumeCalls         int
+	consumeFailures      int
+	consumeBody          []byte
+	consumeTokens        []string
+	noCredits            bool
 }
 
 func (h *quotaResourceHost) Call(method string, payload any) (json.RawMessage, error) {
 	switch method {
 	case pluginabi.MethodHostAuthList:
+		h.authListCalls++
 		files := make([]pluginapi.HostAuthFileEntry, 0, len(h.auths))
 		for index, auth := range h.auths {
 			files = append(files, pluginapi.HostAuthFileEntry{AuthIndex: index, ID: index, Provider: quotaCodexProvider, Email: auth.email})
 		}
 		return json.Marshal(hostAuthListResponse{Files: files})
 	case pluginabi.MethodHostAuthGet:
+		h.authGetCalls++
 		raw, err := json.Marshal(payload)
 		if err != nil {
 			return nil, err
@@ -332,10 +461,19 @@ func (h *quotaResourceHost) Call(method string, payload any) (json.RawMessage, e
 			h.consumeCalls++
 			h.consumeBody = append([]byte(nil), request.Body...)
 			h.consumeTokens = append(h.consumeTokens, strings.TrimPrefix(request.Headers.Get("Authorization"), "Bearer "))
+			if h.consumeFailures > 0 {
+				h.consumeFailures--
+				return json.Marshal(pluginapi.HTTPResponse{StatusCode: http.StatusServiceUnavailable})
+			}
 			body, _ := json.Marshal(map[string]any{"code": "reset", "windows_reset": 2})
 			return json.Marshal(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: body})
 		}
 		if strings.HasSuffix(request.URL, "/rate-limit-reset-credits") {
+			h.resetCreditsCalls++
+			if h.resetCreditsFailures > 0 {
+				h.resetCreditsFailures--
+				return json.Marshal(pluginapi.HTTPResponse{StatusCode: http.StatusServiceUnavailable})
+			}
 			count := 1
 			credits := []map[string]any{{"id": "private-credit-id", "reset_type": "codex_rate_limits", "status": "available", "expires_at": "2030-07-17T12:30:00Z"}}
 			if h.noCredits {
@@ -344,6 +482,11 @@ func (h *quotaResourceHost) Call(method string, payload any) (json.RawMessage, e
 			}
 			body, _ := json.Marshal(map[string]any{"available_count": count, "credits": credits})
 			return json.Marshal(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: body})
+		}
+		h.usageCalls++
+		if h.usageFailures > 0 {
+			h.usageFailures--
+			return json.Marshal(pluginapi.HTTPResponse{StatusCode: http.StatusServiceUnavailable})
 		}
 		token := strings.TrimPrefix(request.Headers.Get("Authorization"), "Bearer ")
 		remaining := 0.0
