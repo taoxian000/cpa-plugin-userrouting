@@ -18,9 +18,11 @@ plugins:
         apikey_2: "prefix_2/"
         default: ""
 
-      # Register additional deduplicated unprefixed models. This is additive;
-      # CPA's original prefixed models remain visible.
+      # Register additional deduplicated unprefixed models.
       register_deduplicated_models: false
+      # Hide configured prefixed entries in model-list responses, while keeping
+      # those models registered and directly routable. Requires registration above.
+      hide_prefixed_models: false
       # Include prefix_map.default when building the deduplication prefix list.
       include_default_prefix: true
 

@@ -3,6 +3,7 @@ package userrouting
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -34,6 +35,17 @@ func TestPrefixMapAcceptsMappingAndJSONString(t *testing.T) {
 				t.Fatalf("default prefix = %q, want fallback/", got)
 			}
 		})
+	}
+}
+
+func TestValidateMappedKeysRedactsAPIKeys(t *testing.T) {
+	secret := "sk-test-secret-value"
+	err := validateMappedKeys(PrefixMap{secret: "prefix/"}, map[string]struct{}{})
+	if err == nil {
+		t.Fatal("validateMappedKeys() error = nil, want unknown key error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("validation error exposed API key: %v", err)
 	}
 }
 
@@ -70,12 +82,16 @@ func TestModelRegistrationConfigDefaultsAndOverrides(t *testing.T) {
 	if defaultConfig.RegisterDeduplicatedModels {
 		t.Fatal("register_deduplicated_models default = true, want false")
 	}
+	if defaultConfig.HidePrefixedModels {
+		t.Fatal("hide_prefixed_models default = true, want false")
+	}
 	if !defaultConfig.IncludeDefaultPrefix {
 		t.Fatal("include_default_prefix default = false, want true")
 	}
 
 	override := []byte("cpa_config_path: " + quotedYAML(path) + "\n" +
 		"register_deduplicated_models: true\n" +
+		"hide_prefixed_models: true\n" +
 		"include_default_prefix: false\n")
 	configured, err := decodeRuntimeConfig(override, ConfigureOptions{})
 	if err != nil {
@@ -83,6 +99,9 @@ func TestModelRegistrationConfigDefaultsAndOverrides(t *testing.T) {
 	}
 	if !configured.RegisterDeduplicatedModels || configured.IncludeDefaultPrefix {
 		t.Fatalf("model registration config = (%v, %v), want (true, false)", configured.RegisterDeduplicatedModels, configured.IncludeDefaultPrefix)
+	}
+	if !configured.HidePrefixedModels {
+		t.Fatal("hide_prefixed_models override = false, want true")
 	}
 }
 

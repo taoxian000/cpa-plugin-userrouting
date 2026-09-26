@@ -14,7 +14,11 @@ const modelRegistrationProvider = PluginIdentifier
 // registry. The original prefixed models remain available in CPA.
 func (r *Runtime) RegisterModels(ctx context.Context) (pluginapi.ModelRegistrationResponse, error) {
 	response := pluginapi.ModelRegistrationResponse{Provider: modelRegistrationProvider}
-	if r == nil || !r.config.RegisterDeduplicatedModels {
+	if r == nil {
+		return response, nil
+	}
+	r.deduplicatedModelsLoaded.Store(false)
+	if !r.config.RegisterDeduplicatedModels {
 		return response, nil
 	}
 
@@ -75,6 +79,11 @@ func (r *Runtime) RegisterModels(ctx context.Context) (pluginapi.ModelRegistrati
 	for _, id := range ids {
 		response.Models = append(response.Models, models[id])
 	}
+	// Do not hide source models unless at least one replacement was discovered.
+	// During this method CPA may call back into /v1/models for catalog lookup;
+	// keeping the filter disabled until discovery completes avoids filtering our
+	// own inputs and leaving the public catalog empty.
+	r.deduplicatedModelsLoaded.Store(len(response.Models) > 0)
 	return response, nil
 }
 
@@ -108,6 +117,12 @@ func (r *Runtime) deduplicationPrefixes() []string {
 		return prefixes[i] < prefixes[j]
 	})
 	return prefixes
+}
+
+// HidePrefixedModels reports whether the model-list response interceptor should
+// be registered. Hiding is meaningful only while deduplicated models are added.
+func (r *Runtime) HidePrefixedModels() bool {
+	return r != nil && r.config.RegisterDeduplicatedModels && r.config.HidePrefixedModels
 }
 
 func stripModelPrefix(model string, prefixes []string) (string, bool) {

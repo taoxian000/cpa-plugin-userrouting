@@ -105,6 +105,11 @@ type rpcQuotaResetRequest struct {
 	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
+type rpcResponseInterceptRequest struct {
+	pluginapi.ResponseInterceptRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
 type registration struct {
 	SchemaVersion uint32                 `json:"schema_version"`
 	Metadata      pluginapi.Metadata     `json:"metadata"`
@@ -117,6 +122,7 @@ type registrationCapability struct {
 	Executor              bool     `json:"executor"`
 	ManagementAPI         bool     `json:"management_api"`
 	QuotaProvider         bool     `json:"quota_provider"`
+	ResponseInterceptor   bool     `json:"response_interceptor"`
 	ExecutorModelScope    string   `json:"executor_model_scope"`
 	ExecutorInputFormats  []string `json:"executor_input_formats"`
 	ExecutorOutputFormats []string `json:"executor_output_formats"`
@@ -210,6 +216,20 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return errorEnvelopeFor(err), nil
 		}
 		response, err := runtime.RegisterModels(context.Background())
+		if err != nil {
+			return errorEnvelopeFor(err), nil
+		}
+		return okEnvelope(response)
+	case pluginabi.MethodResponseInterceptAfter:
+		runtime, err := loadedRuntime()
+		if err != nil {
+			return errorEnvelopeFor(err), nil
+		}
+		var req rpcResponseInterceptRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return errorEnvelopeFor(err), nil
+		}
+		response, err := runtime.InterceptResponse(context.Background(), req.ResponseInterceptRequest)
 		if err != nil {
 			return errorEnvelopeFor(err), nil
 		}
@@ -372,6 +392,7 @@ func pluginRegistration(runtime *userrouting.Runtime) registration {
 				{Name: "cpa_config_path", Type: pluginapi.ConfigFieldTypeString, Description: "CPA config.yaml path. Empty uses the CPA -config argument, CPA_CONFIG_PATH, or ./config.yaml."},
 				{Name: "prefix_map", Type: pluginapi.ConfigFieldTypeObject, Description: "Map native CPA api-keys to model prefixes. The reserved default key is the fallback prefix."},
 				{Name: "register_deduplicated_models", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Register additional deduplicated unprefixed models in CPA's model catalog."},
+				{Name: "hide_prefixed_models", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Hide configured prefixed model entries from model-list responses after deduplicated models are registered. Requires register_deduplicated_models; direct requests remain routable."},
 				{Name: "include_default_prefix", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Include the reserved default prefix when building the deduplication prefix list."},
 				{Name: "quota_fallback", Type: pluginapi.ConfigFieldTypeObject, Description: "Optional ordered cross-prefix fallback. Set fallback_on_other_errors to retry other upstream errors too."},
 				{Name: "quota_provider", Type: pluginapi.ConfigFieldTypeObject, Description: "Register the Codex quota provider and public quota resources; the direct query route accepts a Codex access token without a downstream API key."},
@@ -389,6 +410,7 @@ func pluginRegistration(runtime *userrouting.Runtime) registration {
 			Executor:              true,
 			ManagementAPI:         resourceEnabled,
 			QuotaProvider:         quotaEnabled,
+			ResponseInterceptor:   runtime != nil && runtime.HidePrefixedModels(),
 			ExecutorModelScope:    string(pluginapi.ExecutorModelScopeStatic),
 			ExecutorInputFormats:  append([]string(nil), formats...),
 			ExecutorOutputFormats: append([]string(nil), formats...),

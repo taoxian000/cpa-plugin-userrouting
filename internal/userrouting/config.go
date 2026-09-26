@@ -77,6 +77,7 @@ type pluginConfig struct {
 	CPAConfigPath               string              `yaml:"cpa_config_path"`
 	PrefixMap                   PrefixMap           `yaml:"prefix_map"`
 	RegisterDeduplicatedModels  bool                `yaml:"register_deduplicated_models"`
+	HidePrefixedModels          bool                `yaml:"hide_prefixed_models"`
 	IncludeDefaultPrefix        bool                `yaml:"include_default_prefix"`
 	QuotaFallback               quotaFallbackConfig `yaml:"quota_fallback"`
 	QuotaProvider               quotaProviderConfig `yaml:"quota_provider"`
@@ -108,6 +109,7 @@ type runtimeConfig struct {
 	Enabled                     bool
 	PrefixMap                   PrefixMap
 	RegisterDeduplicatedModels  bool
+	HidePrefixedModels          bool
 	IncludeDefaultPrefix        bool
 	QuotaFallback               quotaFallbackConfig
 	QuotaProvider               quotaProviderConfig
@@ -196,6 +198,7 @@ func decodeRuntimeConfig(raw []byte, opts ConfigureOptions) (runtimeConfig, erro
 		Enabled:                     cfg.Enabled,
 		PrefixMap:                   clonePrefixMap(cfg.PrefixMap),
 		RegisterDeduplicatedModels:  cfg.RegisterDeduplicatedModels,
+		HidePrefixedModels:          cfg.HidePrefixedModels,
 		IncludeDefaultPrefix:        cfg.IncludeDefaultPrefix,
 		QuotaFallback:               quotaFallback,
 		QuotaProvider:               cfg.QuotaProvider,
@@ -406,7 +409,7 @@ func validateMappedKeys(prefixes PrefixMap, keys map[string]struct{}) error {
 		return nil
 	}
 	sort.Strings(unknown)
-	return fmt.Errorf("prefix_map contains API keys not present in CPA api-keys: %s", strings.Join(unknown, ", "))
+	return fmt.Errorf("prefix_map contains %d API key(s) not present in CPA api-keys; key values are redacted", len(unknown))
 }
 
 func deriveModelsURL(snapshot CPAConfigSnapshot) (string, error) {

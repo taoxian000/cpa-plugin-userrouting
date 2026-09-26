@@ -2,7 +2,9 @@ package userrouting
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,17 +15,25 @@ import (
 )
 
 type modelCatalog struct {
-	url     string
-	ttl     time.Duration
-	timeout time.Duration
-	client  *http.Client
+	url                  string
+	ttl                  time.Duration
+	timeout              time.Duration
+	client               *http.Client
+	internalBypassHeader string
+	internalBypassToken  string
 
 	mu        sync.Mutex
 	expiresAt time.Time
 	models    map[string]struct{}
 }
 
-func newModelCatalog(cfg runtimeConfig) *modelCatalog {
+const internalCatalogBypassHeader = "X-CPA-User-Routing-Internal-Catalog"
+
+func newModelCatalog(cfg runtimeConfig) (*modelCatalog, error) {
+	randomToken := make([]byte, 32)
+	if _, err := rand.Read(randomToken); err != nil {
+		return nil, fmt.Errorf("create internal catalog bypass token: %w", err)
+	}
 	transport := &http.Transport{
 		Proxy: nil,
 		TLSClientConfig: &tls.Config{ // #nosec G402 -- explicitly controlled for a loopback CPA endpoint.
@@ -31,11 +41,17 @@ func newModelCatalog(cfg runtimeConfig) *modelCatalog {
 		},
 	}
 	return &modelCatalog{
-		url:     cfg.ModelsURL,
-		ttl:     cfg.ModelCacheTTL,
-		timeout: cfg.ModelLookupTimeout,
-		client:  &http.Client{Transport: transport},
-	}
+		url:                  cfg.ModelsURL,
+		ttl:                  cfg.ModelCacheTTL,
+		timeout:              cfg.ModelLookupTimeout,
+		client:               &http.Client{Transport: transport},
+		internalBypassHeader: internalCatalogBypassHeader,
+		internalBypassToken:  base64.RawURLEncoding.EncodeToString(randomToken),
+	}, nil
+}
+
+func (c *modelCatalog) isInternalRequest(headers http.Header) bool {
+	return c != nil && c.internalBypassToken != "" && headers.Get(c.internalBypassHeader) == c.internalBypassToken
 }
 
 func (c *modelCatalog) Exists(ctx context.Context, apiKey, model string) (bool, error) {
@@ -85,6 +101,7 @@ func (c *modelCatalog) fetch(ctx context.Context, apiKey string) (map[string]str
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set(c.internalBypassHeader, c.internalBypassToken)
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("query CPA model catalog: %w", err)

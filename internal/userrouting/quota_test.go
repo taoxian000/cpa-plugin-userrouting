@@ -204,7 +204,7 @@ func TestDirectQuotaResourceForwardsTokenWithoutCPAKeyOrPrefixLookup(t *testing.
 		QuotaProvider: quotaProviderConfig{Enabled: true, PublicEndpoint: true},
 	}}
 	registered := runtime.RegisterManagement()
-	if len(registered.Resources) != 3 || registered.Resources[1].Path != quotaDirectResourcePath {
+	if len(registered.Resources) != 4 || registered.Resources[1].Path != quotaDirectResourcePath {
 		t.Fatalf("registered resources = %#v, want direct quota route", registered.Resources)
 	}
 	response, err := runtime.HandleManagement(context.Background(), pluginapi.ManagementRequest{
@@ -230,6 +230,56 @@ func TestDirectQuotaResourceForwardsTokenWithoutCPAKeyOrPrefixLookup(t *testing.
 	}
 	if host.authListCalls != 0 || host.authGetCalls != 0 || host.usageCalls != 1 || host.resetCreditsCalls != 1 {
 		t.Fatalf("host calls = auth-list %d, auth-get %d, usage %d, reset credits %d", host.authListCalls, host.authGetCalls, host.usageCalls, host.resetCreditsCalls)
+	}
+}
+
+func TestDirectQuotaResetUsesAccessTokenAndAccountClaimWithoutCPAKey(t *testing.T) {
+	token := testCodexAccessToken("direct@example.com", "account-direct")
+	host := &quotaResourceHost{}
+	runtime := &Runtime{host: host, config: runtimeConfig{
+		Enabled:       true,
+		QuotaProvider: quotaProviderConfig{Enabled: true, PublicEndpoint: true},
+	}}
+	registered := runtime.RegisterManagement()
+	if len(registered.Resources) != 4 || registered.Resources[3].Path != quotaDirectResetPath {
+		t.Fatalf("registered resources = %#v, want direct reset resource", registered.Resources)
+	}
+	response, err := runtime.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   "/v0/resource/plugins/user-routing/quota/direct/reset",
+		Headers: http.Header{
+			"Authorization": []string{"Bearer " + token},
+		},
+	}, "callback-1")
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("HandleManagement() = (%#v, %v), want 200", response, err)
+	}
+	var decoded quotaDirectResetResourceResponse
+	if err := json.Unmarshal(response.Body, &decoded); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !decoded.Success || decoded.Partial || !decoded.Accounts["direct@example.com"].Success {
+		t.Fatalf("direct reset response = %#v, body=%s", decoded, response.Body)
+	}
+	if host.authListCalls != 0 || host.authGetCalls != 0 || host.consumeCalls != 1 {
+		t.Fatalf("host calls = auth-list %d, auth-get %d, consume %d; want no auth lookup and one consume", host.authListCalls, host.authGetCalls, host.consumeCalls)
+	}
+	if host.consumeTokens[0] != token {
+		t.Fatal("reset request did not use the supplied Codex access token")
+	}
+	if strings.Contains(string(response.Body), token) || strings.Contains(string(response.Body), "private-credit-id") {
+		t.Fatal("direct reset response contains credential or private reset-credit data")
+	}
+
+	postResponse, err := runtime.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/resource/plugins/user-routing/quota/direct/reset",
+		Headers: http.Header{
+			"Authorization": []string{"Bearer " + token},
+		},
+	}, "callback-1")
+	if err != nil || postResponse.StatusCode != http.StatusMethodNotAllowed || host.consumeCalls != 1 {
+		t.Fatalf("POST response = (%#v, %v), consume calls=%d; want 405 and no additional consume", postResponse, err, host.consumeCalls)
 	}
 }
 
@@ -296,8 +346,8 @@ func TestQuotaResetResourceSynchronouslyResetsOnlyNominalAccounts(t *testing.T) 
 	}}
 
 	registered := runtime.RegisterManagement()
-	if len(registered.Resources) != 3 || registered.Resources[2].Path != quotaResetResourcePath {
-		t.Fatalf("registered resources = %#v, want quota, direct quota, and reset routes", registered.Resources)
+	if len(registered.Resources) != 4 || registered.Resources[2].Path != quotaResetResourcePath || registered.Resources[3].Path != quotaDirectResetPath {
+		t.Fatalf("registered resources = %#v, want quota, direct quota, reset, and direct reset routes", registered.Resources)
 	}
 	response, err := runtime.HandleManagement(context.Background(), pluginapi.ManagementRequest{
 		Method:  http.MethodGet,

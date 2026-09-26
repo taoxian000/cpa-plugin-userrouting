@@ -24,7 +24,9 @@
 
 ### 去重模型注册
 
-默认关闭。启用 `register_deduplicated_models` 后，插件会通过 CPA 的模型注册能力，额外注册去掉配置前缀并去重后的模型名；CPA 原有的带前缀模型仍会保留。`include_default_prefix` 默认开启，非空的 `default` 前缀也会参与剥离；关闭后只使用各 API Key 对应的前缀。该能力需要 CPA v7.2.155 或更高版本。
+默认关闭。启用 `register_deduplicated_models` 后，插件会通过 CPA 的模型注册能力，额外注册去掉配置前缀并去重后的模型名。`include_default_prefix` 默认开启，非空的 `default` 前缀也会参与剥离；关闭后只使用各 API Key 对应的前缀。该能力需要 CPA v7.2.155 或更高版本。
+
+可选的 `hide_prefixed_models: true` 会在模型目录响应中隐藏这些配置前缀对应的原始带前缀模型，仅显示去重后的无前缀模型；它依赖 `register_deduplicated_models: true`。插件会先完成模型发现，再启用目录过滤；如果没有发现任何可注册的去重模型，则保持原目录不变，避免把目录过滤空。这只是目录展示过滤，不会从 CPA 注册表删除模型，手动请求带前缀模型仍可正常路由。该过滤通过 CPA 的响应拦截器实现，需要支持 `response_interceptor` 插件能力的 CPA 版本。
 
 已知问题：本插件目前不能与 [cpa-plugin-codexcomp](https://github.com/uf-hy/cpa-plugin-codexcomp) 同时启用，否则 Codex 的 WebSocket 请求可能因响应流未收到 `response.completed` 而返回 408。
 
@@ -65,6 +67,16 @@ ChatGPT-Account-ID: <Codex tokens.account_id>
 ```
 
 响应使用 `accounts` 字典，键为 access token 中的账户邮箱（无法读取时使用 account ID；邮箱仅用于结果标识，凭据有效性由上游验证），值的额度字段与上面的账户项相同；此路由不返回任何前缀字段。`base_url`、`id_token` 和 `refresh_token` 不需要传入，查询使用默认 Codex 地址。此路由不验证 CPA 下游 Key，持有有效 Codex access token 的请求即可直接查询；请使用 HTTPS，不要把 token 放入 URL，并确保代理及应用日志不会记录 `Authorization`。用量和重置额度详情的只读查询失败时最多重试 3 次。
+
+也可使用相同认证字段同步消耗该账户的一次可用额度重置次数：
+
+```text
+GET /v0/resource/plugins/user-routing/quota/direct/reset
+Authorization: Bearer <Codex tokens.access_token>
+ChatGPT-Account-ID: <Codex tokens.account_id>  # 可选；缺省时尝试从 access token 中读取
+```
+
+重置只需要 `access_token` 和 `account_id`；账户邮箱只用于响应中的账户标识，可从 access token 解码。`id_token`、`refresh_token`、`last_refresh` 和 `base_url` 均不需要，未提供 `base_url` 时使用默认 Codex 地址。响应包含 `success` 和以账户邮箱（或 account ID）为键的 `accounts` 结果。此接口不需要 CPA API Key，也不查询 CPA 认证文件或前缀。它是有副作用的 GET 请求：可用额度查询最多重试 3 次，但实际消费请求只发送一次；不要由浏览器预取、链接预览或自动重试客户端触发。消费由插件直接发送给 Codex，不会清除 CPA 本地额度冷却状态。请使用 HTTPS，并避免记录 `Authorization`。
 
 插件也实现了 CPA 原生 `QuotaProvider.ResetQuota`，可从 CPA 受 Management Key 保护的原生管理接口对单个认证文件消耗一次 Codex 重置额度，例如：
 
@@ -190,6 +202,7 @@ prefix_map: '{"apikey_1":"prefix_1/","apikey_2":"prefix_2/","default":""}'
 | `cpa_config_path` | 自动发现 | 优先使用 CPA 的 `-config` 参数，其次 `CPA_CONFIG_PATH`，最后 `./config.yaml` |
 | `prefix_map` | `{"default":""}` | 原生 Key 到前缀的映射；`default` 为回退前缀 |
 | `register_deduplicated_models` | `false` | 是否向 CPA 额外注册去前缀并去重的模型 |
+| `hide_prefixed_models` | `false` | 是否在模型目录响应中隐藏配置前缀模型；要求开启 `register_deduplicated_models`，只影响展示、不禁用路由 |
 | `include_default_prefix` | `true` | 是否将非空 `default` 前缀加入去重前缀列表 |
 | `quota_fallback.enabled` | `false` | 是否在 Codex 账号返回 `usage_limit_reached` 时启用跨前缀模型回退 |
 | `quota_fallback.fallback_on_other_errors` | `false` | 是否也在其他上游错误时进行跨前缀模型回退；流式请求仅在输出首个内容前回退 |

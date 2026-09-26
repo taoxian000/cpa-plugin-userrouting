@@ -23,6 +23,7 @@ const (
 	quotaResourcePath       = "/quota"
 	quotaDirectResourcePath = "/quota/direct"
 	quotaResetResourcePath  = "/quota/reset"
+	quotaDirectResetPath    = "/quota/direct/reset"
 	quotaCodexProvider      = "codex"
 	quotaQueryRetryCount    = 3
 	quotaQueryRetryDelay    = 100 * time.Millisecond
@@ -259,6 +260,13 @@ type quotaResetResourceResponse struct {
 	Errors          []string                             `json:"errors,omitempty"`
 }
 
+type quotaDirectResetResourceResponse struct {
+	Accounts map[string]quotaResetResourceAccount `json:"accounts,omitempty"`
+	Success  bool                                 `json:"success"`
+	Partial  bool                                 `json:"partial"`
+	Errors   []string                             `json:"errors,omitempty"`
+}
+
 func (r *Runtime) RegisterManagement() pluginapi.ManagementRegistrationResponse {
 	if r == nil || !r.config.Enabled || !r.config.QuotaProvider.Enabled || !r.config.QuotaProvider.PublicEndpoint {
 		return pluginapi.ManagementRegistrationResponse{}
@@ -277,6 +285,10 @@ func (r *Runtime) RegisterManagement() pluginapi.ManagementRegistrationResponse 
 				Path:        quotaResetResourcePath,
 				Description: "Synchronously consume one available Codex quota reset credit for every account under a downstream key's nominal prefix.",
 			},
+			{
+				Path:        quotaDirectResetPath,
+				Description: "Synchronously consume one available Codex quota reset credit using a caller-supplied Codex access token.",
+			},
 		},
 	}
 }
@@ -290,6 +302,9 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 	}
 	if req.Method != "" && !strings.EqualFold(req.Method, http.MethodGet) {
 		return quotaJSONResponse(http.StatusMethodNotAllowed, map[string]string{"error": "GET is required"}), nil
+	}
+	if isQuotaDirectResetResourcePath(req.Path) {
+		return r.handleQuotaDirectResetResource(ctx, req.Headers, callbackID), nil
 	}
 	if isQuotaDirectResourcePath(req.Path) {
 		return r.handleQuotaDirectResource(ctx, req.Headers, callbackID), nil
@@ -438,6 +453,55 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 func isQuotaDirectResourcePath(path string) bool {
 	path = "/" + strings.Trim(strings.TrimSpace(path), "/")
 	return path == quotaDirectResourcePath || strings.HasSuffix(path, "/plugins/user-routing"+quotaDirectResourcePath)
+}
+
+func isQuotaDirectResetResourcePath(path string) bool {
+	path = "/" + strings.Trim(strings.TrimSpace(path), "/")
+	return path == quotaDirectResetPath || strings.HasSuffix(path, "/plugins/user-routing"+quotaDirectResetPath)
+}
+
+// handleQuotaDirectResetResource consumes one reset credit for the caller's
+// Codex account. The request uses the same access token and account ID inputs
+// as /quota/direct and does not require a CPA API key or auth-file lookup.
+func (r *Runtime) handleQuotaDirectResetResource(ctx context.Context, headers http.Header, callbackID string) pluginapi.ManagementResponse {
+	accessToken := extractBearerToken(headers.Get("Authorization"))
+	if accessToken == "" {
+		accessToken = extractBearerToken(headers.Get("X-Codex-Access-Token"))
+	}
+	if accessToken == "" {
+		return quotaJSONResponse(http.StatusBadRequest, map[string]string{"error": "a Codex access token is required"})
+	}
+	email, accountIDFromToken := codexTokenDisplayClaims(accessToken)
+	accountID := strings.TrimSpace(headers.Get("ChatGPT-Account-ID"))
+	if accountID == "" {
+		accountID = strings.TrimSpace(headers.Get("X-Codex-Account-ID"))
+	}
+	if accountID == "" {
+		accountID = accountIDFromToken
+	}
+	if accountID == "" {
+		return quotaJSONResponse(http.StatusBadRequest, map[string]string{"error": "a Codex account ID is required"})
+	}
+	storageJSON, err := json.Marshal(map[string]string{"access_token": accessToken, "account_id": accountID})
+	if err != nil {
+		return quotaJSONResponse(http.StatusInternalServerError, map[string]string{"error": "could not prepare Codex credentials"})
+	}
+	reset := r.ResetQuota(ctx, pluginapi.QuotaResetRequest{
+		Provider:    quotaCodexProvider,
+		StorageJSON: storageJSON,
+		HTTPClient:  &quotaHTTPClient{host: r.host, callbackID: callbackID},
+	}, callbackID)
+	account := email
+	if account == "" {
+		account = accountID
+	}
+	result := quotaDirectResetResourceResponse{
+		Accounts: map[string]quotaResetResourceAccount{
+			account: {Success: reset.Success, Message: reset.Message},
+		},
+		Success: reset.Success,
+	}
+	return quotaJSONResponse(http.StatusOK, result)
 }
 
 func (r *Runtime) handleQuotaDirectResource(ctx context.Context, headers http.Header, callbackID string) pluginapi.ManagementResponse {

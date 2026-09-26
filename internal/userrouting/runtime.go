@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -35,9 +36,10 @@ type HostCaller interface {
 }
 
 type Runtime struct {
-	host    HostCaller
-	config  runtimeConfig
-	catalog *modelCatalog
+	host                     HostCaller
+	config                   runtimeConfig
+	catalog                  *modelCatalog
+	deduplicatedModelsLoaded atomic.Bool
 }
 
 func NewRuntime(host HostCaller, rawConfig []byte, opts ConfigureOptions) (*Runtime, error) {
@@ -48,10 +50,14 @@ func NewRuntime(host HostCaller, rawConfig []byte, opts ConfigureOptions) (*Runt
 	if err != nil {
 		return nil, err
 	}
+	catalog, err := newModelCatalog(cfg)
+	if err != nil {
+		return nil, err
+	}
 	return &Runtime{
 		host:    host,
 		config:  cfg,
-		catalog: newModelCatalog(cfg),
+		catalog: catalog,
 	}, nil
 }
 

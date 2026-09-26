@@ -24,7 +24,9 @@ The plugin never writes API keys to its logs. The model catalog is cached for fi
 
 ### Deduplicated model registration
 
-Disabled by default. When `register_deduplicated_models` is enabled, the plugin uses CPA's model registration capability to add deduplicated, unprefixed model names; CPA's original prefixed models remain visible. `include_default_prefix` is enabled by default and includes a non-empty `default` prefix; disabling it limits stripping to API-key prefixes. This capability requires CPA v7.2.155 or later.
+Disabled by default. When `register_deduplicated_models` is enabled, the plugin uses CPA's model registration capability to add deduplicated, unprefixed model names. `include_default_prefix` is enabled by default and includes a non-empty `default` prefix; disabling it limits stripping to API-key prefixes. This capability requires CPA v7.2.155 or later.
+
+The optional `hide_prefixed_models: true` hides the original prefixed entries from model-list responses, leaving the deduplicated unprefixed entries visible. It requires `register_deduplicated_models: true`. Model discovery completes before filtering is enabled; if no deduplicated replacement models are discovered, the original catalog is left unchanged to avoid an empty catalog. This filters catalog responses only; it does not remove models from CPA's registry, so direct requests using a prefixed model remain routable. Filtering uses CPA's response-interceptor capability and therefore requires a CPA version that supports `response_interceptor` plugins.
 
 Known issue: this plugin currently cannot be enabled together with [cpa-plugin-codexcomp](https://github.com/uf-hy/cpa-plugin-codexcomp). Otherwise, Codex WebSocket requests may return 408 because the response stream does not receive `response.completed`.
 
@@ -65,6 +67,16 @@ ChatGPT-Account-ID: <Codex tokens.account_id>
 ```
 
 The response contains an `accounts` dictionary keyed by the email claim in the access token (falling back to the account ID), with the same quota fields as above. The email is only a display label; the upstream validates the credential. This route returns no prefix fields. `base_url`, `id_token`, and `refresh_token` are not required; the default Codex endpoint is used. The route does not validate a CPA downstream key: anyone presenting a valid Codex access token can query its quota. Use HTTPS, never put the token in the URL, and ensure that proxies and application logs redact `Authorization`. Read-only usage and reset-credit detail queries retry up to three times.
+
+The same credentials can synchronously consume one available reset credit for that account:
+
+```text
+GET /v0/resource/plugins/user-routing/quota/direct/reset
+Authorization: Bearer <Codex tokens.access_token>
+ChatGPT-Account-ID: <Codex tokens.account_id>  # optional; otherwise read from the access-token claim
+```
+
+Reset requires only `access_token` and `account_id`; the email is used only as the response account label and can be decoded from the access token. `id_token`, `refresh_token`, `last_refresh`, and `base_url` are not required; the default Codex endpoint is used when no base URL is provided. The response contains `success` and an `accounts` result keyed by email (or account ID). No CPA API key, CPA auth-file lookup, or prefix lookup is involved. This is a mutating GET request: the read-only credit lookup may retry up to three times, but the consumption request is sent only once. Do not trigger it through browser prefetch, link previews, or automatic client retries. Consumption is sent directly to Codex and does not clear CPA's local quota cooldown. Use HTTPS and ensure `Authorization` is not logged.
 
 The plugin also implements CPA's native `QuotaProvider.ResetQuota`, which can consume one Codex reset credit for a single auth file through CPA's native Management API, protected by the Management Key:
 
@@ -190,6 +202,7 @@ Non-empty prefixes are normalized to end with `/`, so `prefix_1` and `prefix_1/`
 | `cpa_config_path` | Auto-discovered | CPA's `-config` argument is used first, then `CPA_CONFIG_PATH`, then `./config.yaml`. |
 | `prefix_map` | `{"default":""}` | Mapping from native API keys to prefixes; `default` is the fallback prefix. |
 | `register_deduplicated_models` | `false` | Register additional unprefixed, deduplicated models in CPA. |
+| `hide_prefixed_models` | `false` | Hide configured prefixed models from catalog responses; requires `register_deduplicated_models` and does not disable routing. |
 | `include_default_prefix` | `true` | Include a non-empty `default` prefix in the deduplication prefix list. |
 | `quota_fallback.enabled` | `false` | Enable cross-prefix model fallback when a Codex account returns `usage_limit_reached`. |
 | `quota_fallback.fallback_on_other_errors` | `false` | Also perform cross-prefix fallback for other upstream errors; streaming requests only fall back before their first emitted payload. |
