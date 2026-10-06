@@ -58,6 +58,60 @@ func TestDecodeRuntimeConfigRejectsUnknownMappedKey(t *testing.T) {
 	}
 }
 
+func TestCPAConfigReaderSupportsV8Layout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	raw := `config-version: 8
+server:
+  host: 127.0.0.1
+  port: 8321
+  tls:
+    enable: true
+access:
+  api-keys:
+    - v8-client-key
+api-keys:
+  codex:
+    - name: upstream-codex
+      base-url: https://api.example.invalid
+      keys:
+        - api-key: upstream-provider-key
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatalf("write CPA v8 config: %v", err)
+	}
+
+	snapshot, err := NewCPAConfigReader(path).Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	if snapshot.Host != "127.0.0.1" || snapshot.Port != 8321 || !snapshot.TLS {
+		t.Fatalf("server snapshot = (%q, %d, %v), want (127.0.0.1, 8321, true)", snapshot.Host, snapshot.Port, snapshot.TLS)
+	}
+	if _, ok := snapshot.APIKeys["v8-client-key"]; !ok || len(snapshot.APIKeys) != 1 {
+		t.Fatalf("client API keys = %#v, want only the access.api-keys value", snapshot.APIKeys)
+	}
+}
+
+func TestCPAConfigReaderPrefersV8ClientAPIKeysOverLegacyList(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	raw := `api-keys:
+  - legacy-client-key
+access:
+  api-keys: []
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatalf("write mixed CPA config: %v", err)
+	}
+
+	snapshot, err := NewCPAConfigReader(path).Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	if len(snapshot.APIKeys) != 0 {
+		t.Fatalf("client API keys = %#v, want the explicitly empty v8 list to take precedence", snapshot.APIKeys)
+	}
+}
+
 func TestResolveCPAConfigPathUsesCPAArgument(t *testing.T) {
 	cwd := t.TempDir()
 	got, err := resolveCPAConfigPath("", ConfigureOptions{

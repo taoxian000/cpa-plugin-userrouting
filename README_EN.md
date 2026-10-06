@@ -216,9 +216,9 @@ Non-empty prefixes are normalized to end with `/`, so `prefix_1` and `prefix_1/`
 | `models_tls_insecure_skip_verify` | `false` | Enable only when local CPA HTTPS uses an untrusted certificate. |
 | `log_routing` | `true` | Record the final model in CPA's main log. |
 
-When `strict_key_validation` is enabled, the plugin verifies that every API key in `prefix_map` exists in CPA's main `api-keys` list. It rejects a configuration load or reload if a key is missing, preventing a typo from silently disabling a routing rule. When disabled, keys may be configured before they are added to `api-keys`; however, a request uses a mapped prefix only when it carries a CPA-authenticated API key, and unmatched requests always use the `default` prefix.
+When `strict_key_validation` is enabled, the plugin verifies that every API key in `prefix_map` exists in CPA's downstream client-key list. Legacy configurations use the root `api-keys`; CPA v8 configurations use `access.api-keys`. The root `api-keys` provider map in v8 is not treated as a client-key list. A missing mapped key rejects configuration load/reload, preventing a typo from silently disabling a routing rule. When disabled, keys may be configured before they are added to CPA's client-key list; however, a request uses a mapped prefix only when it carries a CPA-authenticated API key, and unmatched requests always use the `default` prefix.
 
-If the CPA configuration file changes at runtime, the plugin rereads `api-keys` based on the file modification time. The plugin's own `prefix_map` is updated through CPA's plugin reconfiguration mechanism.
+If the CPA configuration file changes at runtime, the plugin rereads the client API key list based on the file modification time. The plugin's own `prefix_map` is updated through CPA's plugin reconfiguration mechanism.
 
 ## Logging
 

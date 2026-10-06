@@ -216,9 +216,9 @@ prefix_map: '{"apikey_1":"prefix_1/","apikey_2":"prefix_2/","default":""}'
 | `models_tls_insecure_skip_verify` | `false` | 仅在 CPA 本机 HTTPS 使用不受信证书时开启 |
 | `log_routing` | `true` | 在 CPA 主日志中记录最终模型 |
 
-`strict_key_validation` 开启时，插件会验证 `prefix_map` 中的每个 API Key 都存在于 CPA 主配置的 `api-keys` 列表；发现不存在的 Key 时会拒绝加载或重载配置，以避免拼写错误造成规则静默失效。关闭后可提前配置尚未加入 `api-keys` 的 Key，但实际请求仍只有携带 CPA 已认证 API Key 时才会使用对应前缀，未匹配时始终使用 `default` 前缀。
+`strict_key_validation` 开启时，插件会验证 `prefix_map` 中的每个 API Key 都存在于 CPA 下游客户端 Key 列表；旧版配置读取顶层 `api-keys`，CPA v8 配置读取 `access.api-keys`，不会把顶层 `api-keys` 中的上游 provider Key 当作客户端 Key。发现映射 Key 不存在时会拒绝加载或重载配置，以避免拼写错误造成规则静默失效。关闭后可提前配置尚未加入 CPA 客户端 Key 列表的 Key，但实际请求仍只有携带 CPA 已认证 API Key 时才会使用对应前缀，未匹配时始终使用 `default` 前缀。
 
-如果 CPA 配置文件在运行时更新，插件会按文件修改时间重新读取 `api-keys`。插件自身的 `prefix_map` 由 CPA 的插件重配置机制更新。
+如果 CPA 配置文件在运行时更新，插件会按文件修改时间重新读取客户端 API Key 列表。插件自身的 `prefix_map` 由 CPA 的插件重配置机制更新。
 
 ## 日志说明
 

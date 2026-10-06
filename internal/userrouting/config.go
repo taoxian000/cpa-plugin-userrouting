@@ -324,12 +324,22 @@ type CPAConfigSnapshot struct {
 }
 
 type rawCPAConfig struct {
-	Host    string   `yaml:"host"`
-	Port    int      `yaml:"port"`
-	APIKeys []string `yaml:"api-keys"`
+	Host    string    `yaml:"host"`
+	Port    int       `yaml:"port"`
+	APIKeys yaml.Node `yaml:"api-keys"`
 	TLS     struct {
 		Enable bool `yaml:"enable"`
 	} `yaml:"tls"`
+	Access struct {
+		APIKeys yaml.Node `yaml:"api-keys"`
+	} `yaml:"access"`
+	Server struct {
+		Host *string `yaml:"host"`
+		Port *int    `yaml:"port"`
+		TLS  struct {
+			Enable *bool `yaml:"enable"`
+		} `yaml:"tls"`
+	} `yaml:"server"`
 }
 
 type CPAConfigReader struct {
@@ -375,17 +385,47 @@ func (r *CPAConfigReader) Snapshot() (CPAConfigSnapshot, error) {
 	if err := yaml.Unmarshal(raw, &decoded); err != nil {
 		return CPAConfigSnapshot{}, fmt.Errorf("decode CPA config %q: %w", r.path, err)
 	}
-	keys := make(map[string]struct{}, len(decoded.APIKeys))
-	for _, key := range decoded.APIKeys {
+	apiKeyNode := decoded.APIKeys
+	if decoded.Access.APIKeys.Kind != 0 {
+		// CPA v8 gives access.api-keys precedence over the legacy root field.
+		apiKeyNode = decoded.Access.APIKeys
+	} else if apiKeyNode.Kind == yaml.MappingNode {
+		// In CPA v8 the root api-keys mapping contains upstream provider keys,
+		// not downstream client keys. Those live under access.api-keys.
+		apiKeyNode = yaml.Node{}
+	}
+	var clientAPIKeys []string
+	if apiKeyNode.Kind != 0 && apiKeyNode.Tag != "!!null" {
+		if apiKeyNode.Kind != yaml.SequenceNode {
+			return CPAConfigSnapshot{}, fmt.Errorf("decode CPA config %q: client API keys must be a list", r.path)
+		}
+		if err := apiKeyNode.Decode(&clientAPIKeys); err != nil {
+			return CPAConfigSnapshot{}, fmt.Errorf("decode CPA config %q client API keys: %w", r.path, err)
+		}
+	}
+	keys := make(map[string]struct{}, len(clientAPIKeys))
+	for _, key := range clientAPIKeys {
 		key = strings.TrimSpace(key)
 		if key != "" {
 			keys[key] = struct{}{}
 		}
 	}
+	host := decoded.Host
+	port := decoded.Port
+	tlsEnabled := decoded.TLS.Enable
+	if decoded.Server.Host != nil {
+		host = *decoded.Server.Host
+	}
+	if decoded.Server.Port != nil {
+		port = *decoded.Server.Port
+	}
+	if decoded.Server.TLS.Enable != nil {
+		tlsEnabled = *decoded.Server.TLS.Enable
+	}
 	value := CPAConfigSnapshot{
-		Host:    strings.TrimSpace(decoded.Host),
-		Port:    decoded.Port,
-		TLS:     decoded.TLS.Enable,
+		Host:    strings.TrimSpace(host),
+		Port:    port,
+		TLS:     tlsEnabled,
 		APIKeys: keys,
 	}
 	r.modTime = info.ModTime()
@@ -409,7 +449,7 @@ func validateMappedKeys(prefixes PrefixMap, keys map[string]struct{}) error {
 		return nil
 	}
 	sort.Strings(unknown)
-	return fmt.Errorf("prefix_map contains %d API key(s) not present in CPA api-keys; key values are redacted", len(unknown))
+	return fmt.Errorf("prefix_map contains %d API key(s) not present in CPA client API keys; key values are redacted", len(unknown))
 }
 
 func deriveModelsURL(snapshot CPAConfigSnapshot) (string, error) {
