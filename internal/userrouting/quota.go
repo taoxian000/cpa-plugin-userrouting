@@ -665,12 +665,22 @@ func (r *Runtime) handleQuotaResetResource(ctx context.Context, nominalName stri
 
 func quotaPrefixHasRemaining(prefix quotaPrefixResult) bool {
 	for _, account := range prefix.Accounts {
+		hasWindow := false
+		allWindowsHaveRemaining := true
 		for _, group := range account.QuotaFetchResponse.Groups {
 			for _, bucket := range group.Buckets {
-				if bucket.RemainingFraction > 0 {
-					return true
+				hasWindow = true
+				if bucket.RemainingFraction <= 0 {
+					allWindowsHaveRemaining = false
+					break
 				}
 			}
+			if !allWindowsHaveRemaining {
+				break
+			}
+		}
+		if hasWindow && allWindowsHaveRemaining {
+			return true
 		}
 	}
 	return false

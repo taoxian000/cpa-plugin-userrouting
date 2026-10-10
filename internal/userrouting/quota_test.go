@@ -104,8 +104,8 @@ func TestQuotaResourceReturnsNominalAndActualPrefixes(t *testing.T) {
 	path := writeCPAConfig(t, "key-1")
 	host := &quotaResourceHost{
 		auths: map[string]quotaTestAuth{
-			"auth-1": {prefix: "prefix1", email: "one@example.com", token: "token-1", remaining: 0},
-			"auth-2": {prefix: "prefix2", email: "two@example.com", token: "token-2", remaining: 0.5},
+			"auth-1": {prefix: "prefix1", email: "one@example.com", token: "token-1", remaining: 0, hasSecondary: true, secondaryRemaining: 0.82},
+			"auth-2": {prefix: "prefix2", email: "two@example.com", token: "token-2", remaining: 0.5, hasSecondary: true, secondaryRemaining: 0.4},
 		},
 	}
 	runtime := &Runtime{
@@ -155,6 +155,33 @@ func TestQuotaResourceReturnsNominalAndActualPrefixes(t *testing.T) {
 	}
 	if strings.Contains(string(response.Body), "key-1") || strings.Contains(string(response.Body), "token-") || strings.Contains(string(response.Body), "private-credit-id") {
 		t.Fatalf("response contains credential material: %s", response.Body)
+	}
+}
+
+func TestQuotaPrefixHasRemainingRequiresAllWindowsToBePositive(t *testing.T) {
+	quotaPrefix := func(primary, secondary float64) quotaPrefixResult {
+		return quotaPrefixResult{Accounts: map[string]quotaResourceAccount{
+			"account@example.com": {QuotaFetchResponse: pluginapi.QuotaFetchResponse{Groups: []pluginapi.QuotaGroup{{Buckets: []pluginapi.QuotaBucket{
+				{Window: "primary", RemainingFraction: primary},
+				{Window: "secondary", RemainingFraction: secondary},
+			}}}}},
+		}}
+	}
+	for _, test := range []struct {
+		name      string
+		primary   float64
+		secondary float64
+		want      bool
+	}{
+		{name: "both windows have quota", primary: 0.1, secondary: 0.8, want: true},
+		{name: "primary exhausted", primary: 0, secondary: 0.8, want: false},
+		{name: "secondary exhausted", primary: 0.5, secondary: 0, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := quotaPrefixHasRemaining(quotaPrefix(test.primary, test.secondary)); got != test.want {
+				t.Fatalf("quotaPrefixHasRemaining() = %v, want %v", got, test.want)
+			}
+		})
 	}
 }
 
@@ -442,10 +469,12 @@ func TestResetQuotaDoesNotConsumeWithoutCredits(t *testing.T) {
 }
 
 type quotaTestAuth struct {
-	prefix    string
-	email     string
-	token     string
-	remaining float64
+	prefix             string
+	email              string
+	token              string
+	remaining          float64
+	hasSecondary       bool
+	secondaryRemaining float64
 }
 
 type quotaResourceHost struct {
@@ -547,9 +576,17 @@ func (h *quotaResourceHost) Call(method string, payload any) (json.RawMessage, e
 			}
 		}
 		used := int((1 - remaining) * 100)
-		body, _ := json.Marshal(map[string]any{"plan_type": "pro", "rate_limit": map[string]any{
+		rateLimit := map[string]any{
 			"primary_window": map[string]any{"used_percent": used, "reset_at": 1900000000},
-		}, "rate_limit_reset_credits": map[string]any{"available_count": 1}})
+		}
+		for _, auth := range h.auths {
+			if auth.token == token && auth.hasSecondary {
+				secondaryUsed := int((1 - auth.secondaryRemaining) * 100)
+				rateLimit["secondary_window"] = map[string]any{"used_percent": secondaryUsed, "reset_at": 1900003600}
+				break
+			}
+		}
+		body, _ := json.Marshal(map[string]any{"plan_type": "pro", "rate_limit": rateLimit, "rate_limit_reset_credits": map[string]any{"available_count": 1}})
 		return json.Marshal(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: body})
 	default:
 		return json.RawMessage(`{}`), nil

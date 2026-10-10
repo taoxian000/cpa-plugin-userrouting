@@ -56,7 +56,7 @@ GET /v0/resource/plugins/user-routing/quota
 Authorization: Bearer <CPA 下游 API Key>
 ```
 
-插件会读取请求 Key 对应的名义前缀，并按 `quota_fallback.prefixes` 依次查询后继前缀的 Codex 认证文件；找到首个仍有额度的前缀后即停止查询。响应只保留名义前缀和实际前缀对应的认证账户，不再返回完整的 `prefixes` 列表：`nominal_prefix` 与 `actual_prefix` 表示两种前缀，`nominal_accounts` 与 `actual_accounts` 是以认证账户邮箱为键的字典。如果名义前缀本身仍有额度，`actual_prefix` 仍返回名义前缀，但省略重复的 `actual_accounts`。每个账户项包含标准额度字段，以及 `reset_credits`：`available_count` 为剩余可用重置次数，`expires_at` 为已返回的可用重置次数对应的失效时间列表，`without_expiry` 为不设失效时间的次数，`expiry_details_available` 表示是否成功读取详细有效期，`expiry_details_complete` 表示上游返回的有效期明细是否覆盖全部可用次数（上游可能截断明细）。插件不会返回认证文件索引、令牌、credit ID 或原始认证 JSON。额度用量与重置额度的只读查询失败时会重试 3 次（最多 4 次尝试）；重置次数的实际消费请求不会重试。
+插件会读取请求 Key 对应的名义前缀，并按 `quota_fallback.prefixes` 依次查询后继前缀的 Codex 认证文件；同一账户的所有已返回额度窗口（如 `primary`、`secondary`）都必须大于 0 才视为仍有额度，任一窗口为 0 就继续查询 fallback。找到首个仍有额度的前缀后即停止查询。响应只保留名义前缀和实际前缀对应的认证账户，不再返回完整的 `prefixes` 列表：`nominal_prefix` 与 `actual_prefix` 表示两种前缀，`nominal_accounts` 与 `actual_accounts` 是以认证账户邮箱为键的字典。如果名义前缀本身仍有额度，`actual_prefix` 仍返回名义前缀，但省略重复的 `actual_accounts`。每个账户项包含标准额度字段，以及 `reset_credits`：`available_count` 为剩余可用重置次数，`expires_at` 为已返回的可用重置次数对应的失效时间列表，`without_expiry` 为不设失效时间的次数，`expiry_details_available` 表示是否成功读取详细有效期，`expiry_details_complete` 表示上游返回的有效期明细是否覆盖全部可用次数（上游可能截断明细）。插件不会返回认证文件索引、令牌、credit ID 或原始认证 JSON。额度用量与重置额度的只读查询失败时会重试 3 次（最多 4 次尝试）；重置次数的实际消费请求不会重试。
 
 也可直接用 Codex 标准认证信息查询单个账户，无需 CPA 下游 API Key，也不查前缀或 CPA 认证文件：
 
