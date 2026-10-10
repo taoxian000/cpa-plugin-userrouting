@@ -32,7 +32,7 @@
 
 ### Codex 跨前缀额度回退
 
-默认关闭。启用后，插件仅在 CPA 返回 Codex 的 `usage_limit_reached`（账号额度耗尽）时，把当前已改写模型按顺序替换为配置的后继前缀。例如，`prefix_1/gpt-5.5` 返回额度耗尽后，可改试 `prefix_2/gpt-5.5`，再试 `prefix_3/gpt-5.5`。
+默认关闭。启用后，插件在 CPA 返回 Codex 的 `usage_limit_reached`（账号额度耗尽），或返回 HTTP 429 且错误码为 `model_cooldown`（CPA 判定当前模型的凭证均处于冷却）时，把当前已改写模型按顺序替换为配置的后继前缀。例如，`prefix_1/gpt-5.5` 返回额度耗尽或模型冷却后，可改试 `prefix_2/gpt-5.5`，再试 `prefix_3/gpt-5.5`。默认情况下，普通 HTTP 429 不会单独触发回退。
 
 ```yaml
 quota_fallback:
@@ -45,7 +45,7 @@ quota_fallback:
       - prefix_3
 ```
 
-该列表只执行一层、按给定顺序尝试。默认只有 `usage_limit_reached` 会触发切换；将 `fallback_on_other_errors` 设为 `true` 后，其他上游错误也会触发切换。已经向客户端输出内容的流式请求不会切换。每次切换都会由 CPA 主日志记录为 `quota_fallback=true`。
+该列表只执行一层、按给定顺序尝试。默认仅 `usage_limit_reached` 和 CPA 的 `model_cooldown` 错误会触发切换；普通 HTTP 429 不会单独触发。将 `fallback_on_other_errors` 设为 `true` 后，其他上游错误（包括普通 HTTP 429）也会触发切换。已经向客户端输出内容的流式请求不会切换。每次切换都会由 CPA 主日志记录为 `quota_fallback=true`。切换前缀不会解除 CPA 的账号级冷却；目标前缀仍由 CPA 按自己的冷却状态选择认证文件。
 
 ### Codex 额度查询
 
@@ -204,7 +204,7 @@ prefix_map: '{"apikey_1":"prefix_1/","apikey_2":"prefix_2/","default":""}'
 | `register_deduplicated_models` | `false` | 是否向 CPA 额外注册去前缀并去重的模型 |
 | `hide_prefixed_models` | `false` | 是否在模型目录响应中隐藏配置前缀模型；要求开启 `register_deduplicated_models`，只影响展示、不禁用路由 |
 | `include_default_prefix` | `true` | 是否将非空 `default` 前缀加入去重前缀列表 |
-| `quota_fallback.enabled` | `false` | 是否在 Codex 账号返回 `usage_limit_reached` 时启用跨前缀模型回退 |
+| `quota_fallback.enabled` | `false` | 是否在 Codex 账号返回 `usage_limit_reached` 或 CPA 返回 `model_cooldown` 时启用跨前缀模型回退 |
 | `quota_fallback.fallback_on_other_errors` | `false` | 是否也在其他上游错误时进行跨前缀模型回退；流式请求仅在输出首个内容前回退 |
 | `quota_fallback.prefixes` | 空 | 源前缀到按顺序尝试的目标前缀列表 |
 | `quota_provider.enabled` | `true` | 是否注册 Codex `QuotaProvider` |

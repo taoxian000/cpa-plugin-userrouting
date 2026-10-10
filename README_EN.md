@@ -32,7 +32,7 @@ Known issue: this plugin currently cannot be enabled together with [cpa-plugin-c
 
 ### Codex cross-prefix quota fallback
 
-This feature is disabled by default. When enabled, the plugin switches the rewritten model to configured successor prefixes only if CPA returns Codex's `usage_limit_reached` error (account quota exhausted). For example, after quota exhaustion for `prefix_1/gpt-5.5`, it can try `prefix_2/gpt-5.5` and then `prefix_3/gpt-5.5`.
+This feature is disabled by default. When enabled, the plugin switches the rewritten model to configured successor prefixes when CPA returns Codex's `usage_limit_reached` error (account quota exhausted), or HTTP 429 with error code `model_cooldown` (CPA determined that all credentials for the current model are cooling down). For example, after quota exhaustion or model cooldown for `prefix_1/gpt-5.5`, it can try `prefix_2/gpt-5.5` and then `prefix_3/gpt-5.5`. By default, a generic HTTP 429 alone does not trigger fallback.
 
 ```yaml
 quota_fallback:
@@ -45,7 +45,7 @@ quota_fallback:
       - prefix_3
 ```
 
-The list is applied for one level only and in the specified order. By default, only `usage_limit_reached` triggers a switch. Set `fallback_on_other_errors` to `true` to also switch on other upstream errors. A streaming request that has already emitted content never switches models. Every switch is recorded in the CPA main log with `quota_fallback=true`.
+The list is applied for one level only and in the specified order. By default, only `usage_limit_reached` and CPA's `model_cooldown` errors trigger a switch; a generic HTTP 429 alone does not. Set `fallback_on_other_errors` to `true` to also switch on other upstream errors, including generic HTTP 429 responses. A streaming request that has already emitted content never switches models. Every switch is recorded in the CPA main log with `quota_fallback=true`. Switching prefixes does not clear CPA's credential-wide cooldown; CPA still selects credentials for the target prefix according to its own cooldown state.
 
 ### Codex quota queries
 
@@ -204,7 +204,7 @@ Non-empty prefixes are normalized to end with `/`, so `prefix_1` and `prefix_1/`
 | `register_deduplicated_models` | `false` | Register additional unprefixed, deduplicated models in CPA. |
 | `hide_prefixed_models` | `false` | Hide configured prefixed models from catalog responses; requires `register_deduplicated_models` and does not disable routing. |
 | `include_default_prefix` | `true` | Include a non-empty `default` prefix in the deduplication prefix list. |
-| `quota_fallback.enabled` | `false` | Enable cross-prefix model fallback when a Codex account returns `usage_limit_reached`. |
+| `quota_fallback.enabled` | `false` | Enable cross-prefix model fallback when a Codex account returns `usage_limit_reached` or CPA returns `model_cooldown`. |
 | `quota_fallback.fallback_on_other_errors` | `false` | Also perform cross-prefix fallback for other upstream errors; streaming requests only fall back before their first emitted payload. |
 | `quota_fallback.prefixes` | Empty | Mapping from source prefixes to target prefixes to attempt in order. |
 | `quota_provider.enabled` | `true` | Register the Codex `QuotaProvider`. |

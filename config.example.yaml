@@ -26,8 +26,8 @@ plugins:
       # Include prefix_map.default when building the deduplication prefix list.
       include_default_prefix: true
 
-      # Optional Codex quota-exhaustion fallback. By default, only
-      # usage_limit_reached responses switch models.
+      # Optional Codex quota-exhaustion fallback. By default,
+      # usage_limit_reached and CPA model_cooldown errors switch models.
       # The target list is attempted in order and is not recursive.
       quota_fallback:
         enabled: false

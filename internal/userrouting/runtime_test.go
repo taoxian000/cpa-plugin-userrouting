@@ -216,6 +216,102 @@ func TestExecuteFallsBackAcrossPrefixesAfterCodexQuotaExhausted(t *testing.T) {
 	}
 }
 
+func TestExecuteFallsBackAcrossPrefixesAfterCPAModelCooldown(t *testing.T) {
+	runtime, _ := testRuntime(t, []string{"team-a/gpt-5", "team-b/gpt-5"})
+	host := &quotaFallbackHost{
+		firstStatusCode: http.StatusTooManyRequests,
+		firstBody:       []byte(`{"error":{"code":"model_cooldown"}}`),
+	}
+	runtime.host = host
+	runtime.config.QuotaFallback = quotaFallbackConfig{
+		Enabled: true,
+		Prefixes: map[string][]string{
+			"team-a": {"team-b"},
+		},
+	}
+
+	response, err := runtime.Execute(context.Background(), pluginapi.ExecutorRequest{
+		Model:           "gpt-5",
+		Format:          "openai",
+		SourceFormat:    "openai",
+		Headers:         bearerHeader("key-1"),
+		OriginalRequest: []byte(`{"model":"gpt-5","messages":[]}`),
+	}, "callback-1")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if string(response.Payload) != `{"ok":true}` {
+		t.Fatalf("response payload = %s", response.Payload)
+	}
+	if got, want := host.models, []string{"team-a/gpt-5", "team-b/gpt-5"}; !equalStrings(got, want) {
+		t.Fatalf("host models = %#v, want %#v", got, want)
+	}
+}
+
+func TestExecuteDoesNotFallbackForGeneric429(t *testing.T) {
+	runtime, _ := testRuntime(t, []string{"team-a/gpt-5", "team-b/gpt-5"})
+	host := &quotaFallbackHost{
+		firstStatusCode: http.StatusTooManyRequests,
+		firstBody:       []byte(`{"error":{"code":"rate_limit_exceeded"}}`),
+	}
+	runtime.host = host
+	runtime.config.QuotaFallback = quotaFallbackConfig{
+		Enabled: true,
+		Prefixes: map[string][]string{
+			"team-a": {"team-b"},
+		},
+	}
+
+	_, err := runtime.Execute(context.Background(), pluginapi.ExecutorRequest{
+		Model:        "gpt-5",
+		Format:       "openai",
+		SourceFormat: "openai",
+		Headers:      bearerHeader("key-1"),
+	}, "callback-1")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want generic 429")
+	}
+	if got, want := host.models, []string{"team-a/gpt-5"}; !equalStrings(got, want) {
+		t.Fatalf("host models = %#v, want %#v", got, want)
+	}
+}
+
+func TestCPAModelCooldownClassifierDoesNotMatchGeneric429(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "CPA cooldown response",
+			err:  &StatusError{Status: http.StatusTooManyRequests, Message: `{"error":{"code":"model_cooldown"}}`},
+			want: true,
+		},
+		{
+			name: "wrapped stream cooldown payload",
+			err:  errors.New(`host_call_failed: {"error":{"code":"model_cooldown"}}`),
+			want: true,
+		},
+		{
+			name: "generic 429",
+			err:  &StatusError{Status: http.StatusTooManyRequests, Message: `{"error":{"code":"rate_limit_exceeded"}}`},
+			want: false,
+		},
+		{
+			name: "wrong status with cooldown body",
+			err:  &StatusError{Status: http.StatusBadGateway, Message: `{"error":{"code":"model_cooldown"}}`},
+			want: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isCPAModelCooldown(test.err); got != test.want {
+				t.Fatalf("isCPAModelCooldown() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestExecuteDoesNotFallbackForNonQuotaError(t *testing.T) {
 	runtime, _ := testRuntime(t, []string{"team-a/gpt-5", "team-b/gpt-5"})
 	host := &quotaFallbackHost{quotaError: "host_call_failed: upstream connection reset"}
@@ -298,6 +394,31 @@ func TestRunStreamFallsBackBeforeFirstPayloadAfterCodexQuotaExhausted(t *testing
 	}
 }
 
+func TestRunStreamFallsBackBeforeFirstPayloadAfterCPAModelCooldown(t *testing.T) {
+	runtime, _ := testRuntime(t, []string{"team-a/gpt-5", "team-b/gpt-5"})
+	host := &streamQuotaFallbackHost{firstError: `host_call_failed: {"error":{"code":"model_cooldown"}}`}
+	runtime.host = host
+	runtime.config.QuotaFallback = quotaFallbackConfig{
+		Enabled: true,
+		Prefixes: map[string][]string{
+			"team-a": {"team-b"},
+		},
+	}
+
+	err := runtime.RunStream(context.Background(), pluginapi.ExecutorRequest{
+		Model:        "gpt-5",
+		Format:       "openai",
+		SourceFormat: "openai",
+		Headers:      bearerHeader("key-1"),
+	}, "callback-1", "plugin-stream")
+	if err != nil {
+		t.Fatalf("RunStream() error = %v", err)
+	}
+	if got, want := host.models, []string{"team-a/gpt-5", "team-b/gpt-5"}; !equalStrings(got, want) {
+		t.Fatalf("host models = %#v, want %#v", got, want)
+	}
+}
+
 func TestQuotaFallbackTargetsMatchLongestConfiguredPrefix(t *testing.T) {
 	runtime := &Runtime{config: runtimeConfig{QuotaFallback: quotaFallbackConfig{
 		Enabled: true,
@@ -351,9 +472,11 @@ type fakeHost struct {
 }
 
 type quotaFallbackHost struct {
-	mu         sync.Mutex
-	models     []string
-	quotaError string
+	mu              sync.Mutex
+	models          []string
+	quotaError      string
+	firstStatusCode int
+	firstBody       []byte
 }
 
 func (h *quotaFallbackHost) Call(method string, payload any) (json.RawMessage, error) {
@@ -375,15 +498,19 @@ func (h *quotaFallbackHost) Call(method string, payload any) (json.RawMessage, e
 	attempt := len(h.models)
 	h.mu.Unlock()
 	if attempt == 1 {
+		if h.firstStatusCode != 0 {
+			return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: h.firstStatusCode, Body: h.firstBody})
+		}
 		return nil, errors.New(h.quotaError)
 	}
 	return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true}`)})
 }
 
 type streamQuotaFallbackHost struct {
-	mu      sync.Mutex
-	models  []string
-	emitted []byte
+	mu         sync.Mutex
+	models     []string
+	emitted    []byte
+	firstError string
 }
 
 func (h *streamQuotaFallbackHost) Call(method string, payload any) (json.RawMessage, error) {
@@ -404,7 +531,11 @@ func (h *streamQuotaFallbackHost) Call(method string, payload any) (json.RawMess
 		attempt := len(h.models)
 		h.mu.Unlock()
 		if attempt == 1 {
-			return nil, errors.New(`host_call_failed: {"error":{"type":"usage_limit_reached"}}`)
+			firstError := h.firstError
+			if firstError == "" {
+				firstError = `host_call_failed: {"error":{"type":"usage_limit_reached"}}`
+			}
+			return nil, errors.New(firstError)
 		}
 		return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: http.StatusOK, StreamID: "host-stream"})
 	case pluginabi.MethodHostModelStreamRead:

@@ -381,8 +381,36 @@ func isCodexQuotaExhausted(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "usage_limit_reached")
 }
 
+func isCPAModelCooldown(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr *StatusError
+	if errors.As(err, &statusErr) && statusErr.Status != http.StatusTooManyRequests {
+		return false
+	}
+	return structuredErrorCode(err.Error()) == "model_cooldown"
+}
+
+func structuredErrorCode(message string) string {
+	start := strings.IndexByte(message, '{')
+	if start < 0 {
+		return ""
+	}
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(message[start:]))
+	if err := decoder.Decode(&payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Error.Code)
+}
+
 func (r *Runtime) shouldRetryQuotaFallback(err error) bool {
-	if isCodexQuotaExhausted(err) {
+	if isCodexQuotaExhausted(err) || isCPAModelCooldown(err) {
 		return true
 	}
 	return r != nil && r.config.QuotaFallback.FallbackOnOtherErrors
