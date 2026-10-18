@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +30,8 @@ const (
 	quotaCodexProvider      = "codex"
 	quotaQueryRetryCount    = 3
 	quotaQueryRetryDelay    = 100 * time.Millisecond
+	quotaManagementTimeout  = 15 * time.Second
+	quotaManagementBodyMax  = 2 << 20
 )
 
 // QuotaProviderIdentifier returns the stable plugin quota capability ID used
@@ -104,8 +109,9 @@ func (r *Runtime) QuotaIdentifier() string {
 	return quotaProviderIdentifier
 }
 
-// DescribeQuota is exposed through quota.describe. This plugin intentionally
-// advertises Codex only; other CPA providers are not routed by this plugin.
+// DescribeQuota is exposed through quota.describe. The native QuotaProvider ABI
+// advertises Codex only; the public resource can separately query Claude and
+// Antigravity through CPA's authenticated Management API.
 func (r *Runtime) DescribeQuota(context.Context) pluginapi.QuotaDescribeResponse {
 	if r == nil || !r.config.Enabled || !r.config.QuotaProvider.Enabled {
 		return pluginapi.QuotaDescribeResponse{}
@@ -128,7 +134,18 @@ func (r *Runtime) FetchQuota(ctx context.Context, req pluginapi.QuotaFetchReques
 	if req.HTTPClient == nil {
 		req.HTTPClient = &quotaHTTPClient{host: r.host, callbackID: callbackID}
 	}
-	return fetchCodexQuota(ctx, req)
+	if strings.TrimSpace(req.AuthIndex) == "" || r.config.QuotaCacheTTL <= 0 {
+		return fetchCodexQuota(ctx, req)
+	}
+	cacheKey, err := nativeQuotaCacheKey(req.AuthIndex, req.StorageJSON, req.Metadata, req.Attributes)
+	if err != nil {
+		return fetchCodexQuota(ctx, req)
+	}
+	cached, err := r.quotaCache.get(ctx, cacheKey, r.config.QuotaCacheTTL, func() (quotaCacheValue, bool, error) {
+		quota, fetchErr := fetchCodexQuota(ctx, req)
+		return quotaCacheValue{native: quota}, fetchErr == nil, fetchErr
+	})
+	return cached.native, err
 }
 
 // ResetQuota consumes one Codex rate-limit reset credit through CPA's native
@@ -175,6 +192,9 @@ func (r *Runtime) ResetQuota(ctx context.Context, req pluginapi.QuotaResetReques
 	body, _ := json.Marshal(map[string]string{"redeem_request_id": requestID, "credit_id": creditID})
 	consumeHeaders := codexRequestHeaders(accessToken, accountID)
 	consumeHeaders.Set("Content-Type", "application/json")
+	// The upstream may consume a credit even when the response is lost. Invalidate
+	// before the one mutating request so subsequent reads cannot reuse old quota.
+	r.quotaCache.invalidate(quotaCodexProvider, req.AuthIndex)
 	consumeResponse, err := req.HTTPClient.Do(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     consumeURL,
@@ -232,6 +252,93 @@ type quotaResourceResponse struct {
 	Partial         bool                            `json:"partial"`
 }
 
+// An explicit provider/email query has no prefix selection, but uses the same
+// account map and quota fields as the Codex resource response. SourceWindow
+// preserves provider-specific names after normalizing the two main windows.
+type providerQuotaResourceResponse struct {
+	NominalAccounts map[string]providerQuotaAccount `json:"nominal_accounts"`
+	Partial         bool                            `json:"partial"`
+}
+
+type providerQuotaAccount struct {
+	Subscription       *pluginapi.QuotaSubscription `json:"subscription,omitempty"`
+	Summary            []pluginapi.QuotaMetric      `json:"summary,omitempty"`
+	ServerTimeOffsetMs int64                        `json:"serverTimeOffsetMs,omitempty"`
+	Groups             []providerQuotaGroup         `json:"groups,omitempty"`
+}
+
+type providerQuotaGroup struct {
+	DisplayName string                `json:"displayName,omitempty"`
+	Buckets     []providerQuotaBucket `json:"buckets,omitempty"`
+}
+
+type providerQuotaBucket struct {
+	pluginapi.QuotaBucket
+	SourceWindow string `json:"sourceWindow,omitempty"`
+}
+
+func (b *providerQuotaBucket) UnmarshalJSON(raw []byte) error {
+	var bucket pluginapi.QuotaBucket
+	if err := json.Unmarshal(raw, &bucket); err != nil {
+		return err
+	}
+	var extra struct {
+		SourceWindow string `json:"sourceWindow"`
+	}
+	if err := json.Unmarshal(raw, &extra); err != nil {
+		return err
+	}
+	b.QuotaBucket = bucket
+	b.SourceWindow = extra.SourceWindow
+	return nil
+}
+
+func normalizeProviderQuotaAccount(provider string, quota pluginapi.QuotaFetchResponse) providerQuotaAccount {
+	account := providerQuotaAccount{
+		Subscription:       quota.Subscription,
+		Summary:            quota.Summary,
+		ServerTimeOffsetMs: quota.ServerTimeOffsetMs,
+		Groups:             make([]providerQuotaGroup, 0, len(quota.Groups)),
+	}
+	for _, group := range quota.Groups {
+		normalized := providerQuotaGroup{
+			DisplayName: group.DisplayName,
+			Buckets:     make([]providerQuotaBucket, 0, len(group.Buckets)),
+		}
+		for _, bucket := range group.Buckets {
+			originalWindow := bucket.Window
+			bucket.Window = canonicalProviderQuotaWindow(provider, originalWindow)
+			item := providerQuotaBucket{QuotaBucket: bucket}
+			if bucket.Window != originalWindow {
+				item.SourceWindow = originalWindow
+			}
+			normalized.Buckets = append(normalized.Buckets, item)
+		}
+		account.Groups = append(account.Groups, normalized)
+	}
+	return account
+}
+
+func canonicalProviderQuotaWindow(provider, window string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "claude":
+		switch strings.ToLower(strings.TrimSpace(window)) {
+		case "five-hour", "five_hour", "5h":
+			return "primary"
+		case "seven-day", "seven_day", "weekly":
+			return "secondary"
+		}
+	case "antigravity":
+		switch strings.ToLower(strings.TrimSpace(window)) {
+		case "5h", "five-hour", "five_hour":
+			return "primary"
+		case "weekly", "week", "seven-day", "seven_day":
+			return "secondary"
+		}
+	}
+	return window
+}
+
 // quotaDirectResourceResponse is returned by the token-forwarding resource.
 // It intentionally has no prefix fields because the route performs no prefix
 // lookup and accepts no downstream CPA API key.
@@ -275,7 +382,7 @@ func (r *Runtime) RegisterManagement() pluginapi.ManagementRegistrationResponse 
 		Resources: []pluginapi.ResourceRoute{
 			{
 				Path:        quotaResourcePath,
-				Description: "Query Codex quota using a downstream CPA API key.",
+				Description: "Query Codex quota by downstream CPA API key, or query a CPA credential by provider and email.",
 			},
 			{
 				Path:        quotaDirectResourcePath,
@@ -322,6 +429,18 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 	if apiKey == "" {
 		return quotaJSONResponse(http.StatusUnauthorized, map[string]string{"error": "a valid CPA API key is required"}), nil
 	}
+	provider := strings.TrimSpace(req.Query.Get("provider"))
+	email := strings.TrimSpace(req.Query.Get("email"))
+	if provider != "" || email != "" {
+		if isQuotaResetResourcePath(req.Path) {
+			return quotaJSONResponse(http.StatusBadRequest, map[string]string{"error": "provider and email are supported only by the quota query route"}), nil
+		}
+		if provider == "" || email == "" {
+			return quotaJSONResponse(http.StatusBadRequest, map[string]string{"error": "provider and email must be provided together"}), nil
+		}
+		return r.handleQuotaByProviderEmail(ctx, provider, email, snapshot), nil
+	}
+
 	nominalPrefix, hasSpecific := r.config.PrefixMap[apiKey]
 	if !hasSpecific {
 		nominalPrefix = r.config.PrefixMap["default"]
@@ -373,19 +492,6 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 				prefixResult.Errors = append(prefixResult.Errors, "one Codex credential has no email address")
 				continue
 			}
-			quota, errQuota := r.FetchQuota(ctx, pluginapi.QuotaFetchRequest{
-				AuthIndex:   entry.AuthIndex,
-				AuthID:      entry.ID,
-				Provider:    quotaCodexProvider,
-				StorageJSON: rawAuth,
-				Metadata:    material.Metadata,
-				Attributes:  material.Attributes,
-				HTTPClient:  &quotaHTTPClient{host: r.host, callbackID: callbackID},
-			}, callbackID)
-			if errQuota != nil {
-				prefixResult.Errors = append(prefixResult.Errors, "one Codex quota query failed")
-				continue
-			}
 			fetchRequest := pluginapi.QuotaFetchRequest{
 				AuthIndex:   entry.AuthIndex,
 				AuthID:      entry.ID,
@@ -395,11 +501,26 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 				Attributes:  material.Attributes,
 				HTTPClient:  &quotaHTTPClient{host: r.host, callbackID: callbackID},
 			}
-			resetCredits, errCredits := fetchCodexResetCreditInfo(ctx, fetchRequest, quota)
-			if errCredits != nil {
+			cacheKey := newQuotaCacheKey(quotaCacheCodexResource, quotaCodexProvider, entry.AuthIndex, rawAuth, nil)
+			cached, errQuota := r.quotaCache.get(ctx, cacheKey, r.config.QuotaCacheTTL, func() (quotaCacheValue, bool, error) {
+				quota, err := r.FetchQuota(ctx, fetchRequest, callbackID)
+				if err != nil {
+					return quotaCacheValue{}, false, err
+				}
+				resetCredits, errCredits := fetchCodexResetCreditInfo(ctx, fetchRequest, quota)
+				return quotaCacheValue{
+					account:           quotaResourceAccount{QuotaFetchResponse: quota, ResetCredits: resetCredits},
+					creditsIncomplete: errCredits != nil,
+				}, errCredits == nil, nil
+			})
+			if errQuota != nil {
+				prefixResult.Errors = append(prefixResult.Errors, "one Codex quota query failed")
+				continue
+			}
+			if cached.creditsIncomplete {
 				prefixResult.Errors = append(prefixResult.Errors, "one Codex reset-credit expiry query failed")
 			}
-			prefixResult.Accounts[account] = quotaResourceAccount{QuotaFetchResponse: quota, ResetCredits: resetCredits}
+			prefixResult.Accounts[account] = cached.account
 		}
 		selected := quotaPrefixHasRemaining(prefixResult)
 		if selected {
@@ -448,6 +569,210 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 		return quotaJSONResponse(http.StatusNotFound, result), nil
 	}
 	return quotaJSONResponse(http.StatusOK, result), nil
+}
+
+// handleQuotaByProviderEmail resolves a credential through CPA's host auth ABI,
+// then queries provider quota through CPA's authenticated API-call endpoint for
+// providers implemented by Management Center, or CPA's native quota endpoint
+// for other providers. The management key is intentionally read from CPA's
+// process environment, never plugin config or the caller request. Unlike the
+// default Codex quota query, this explicit provider/email lookup is not scoped
+// to the downstream API key's model prefix.
+func (r *Runtime) handleQuotaByProviderEmail(ctx context.Context, provider, email string, snapshot CPAConfigSnapshot) pluginapi.ManagementResponse {
+	listRaw, err := r.host.Call(pluginabi.MethodHostAuthList, nil)
+	if err != nil {
+		return quotaJSONResponse(http.StatusBadGateway, map[string]string{"error": "CPA auth list is unavailable"})
+	}
+	var listed hostAuthListResponse
+	if err := json.Unmarshal(listRaw, &listed); err != nil {
+		return quotaJSONResponse(http.StatusBadGateway, map[string]string{"error": "invalid CPA auth list response"})
+	}
+
+	type authMatch struct {
+		index     string
+		provider  string
+		account   string
+		projectID string
+		cacheKey  quotaCacheKey
+	}
+	var match *authMatch
+	for _, entry := range listed.Files {
+		entryProvider := strings.TrimSpace(entry.Provider)
+		if entryProvider == "" {
+			entryProvider = strings.TrimSpace(entry.Type)
+		}
+		if entry.Disabled || entry.Unavailable || !strings.EqualFold(entryProvider, provider) || strings.TrimSpace(entry.AuthIndex) == "" {
+			continue
+		}
+		if entry.Email != "" && !strings.EqualFold(strings.TrimSpace(entry.Email), email) {
+			continue
+		}
+
+		rawAuth, errGet := r.getAuthJSON(entry.AuthIndex)
+		if errGet != nil {
+			return quotaJSONResponse(http.StatusBadGateway, map[string]string{"error": "CPA credential could not be read"})
+		}
+		material := decodeAuthMaterial(rawAuth)
+		accountEmail := strings.TrimSpace(entry.Email)
+		if accountEmail == "" {
+			accountEmail = material.email()
+		}
+		if !strings.EqualFold(accountEmail, email) {
+			continue
+		}
+		if match != nil {
+			return quotaJSONResponse(http.StatusConflict, map[string]string{"error": "provider and email match multiple credentials"})
+		}
+		projectID := antigravityProjectID(entry, rawAuth)
+		match = &authMatch{
+			index:     entry.AuthIndex,
+			provider:  entryProvider,
+			account:   accountEmail,
+			projectID: projectID,
+			cacheKey:  newQuotaCacheKey(quotaCacheProviderQuery, entryProvider, entry.AuthIndex, rawAuth, []byte(projectID)),
+		}
+	}
+	if match == nil {
+		return quotaJSONResponse(http.StatusNotFound, map[string]string{"error": "no available credential matches the requested provider and email"})
+	}
+
+	managementKey := strings.TrimSpace(os.Getenv("MANAGEMENT_PASSWORD"))
+	if managementKey == "" {
+		return quotaJSONResponse(http.StatusServiceUnavailable, map[string]string{"error": "provider/email quota lookup requires MANAGEMENT_PASSWORD in the CPA process environment"})
+	}
+
+	cacheTTL := r.config.QuotaCacheTTL
+	switch strings.ToLower(strings.TrimSpace(match.provider)) {
+	case quotaCodexProvider, "claude", "antigravity":
+	default:
+		cacheTTL = 0
+	}
+	cached, errQuery := r.quotaCache.get(ctx, match.cacheKey, cacheTTL, func() (quotaCacheValue, bool, error) {
+		var query cpaQuotaQueryResult
+		var err error
+		switch strings.ToLower(strings.TrimSpace(match.provider)) {
+		case "antigravity", "claude":
+			query, err = queryManagementCenterQuota(ctx, snapshot, managementKey, match.index, match.provider, match.projectID)
+		default:
+			query, err = queryCPAManagementQuota(ctx, snapshot, managementKey, match.index, match.provider)
+		}
+		return quotaCacheValue{query: query}, query.status >= http.StatusOK && query.status < http.StatusMultipleChoices, err
+	})
+	if errQuery != nil {
+		return quotaJSONResponse(http.StatusBadGateway, map[string]string{"error": "CPA quota query failed"})
+	}
+	query := cached.query
+	if query.status < http.StatusOK || query.status >= http.StatusMultipleChoices {
+		if query.status == http.StatusNotImplemented {
+			return quotaJSONResponse(http.StatusNotImplemented, map[string]string{"error": "CPA has no quota provider for this credential"})
+		}
+		return quotaJSONResponse(http.StatusBadGateway, map[string]string{"error": "CPA quota query failed", "status": strconv.Itoa(query.status)})
+	}
+	return quotaJSONResponse(http.StatusOK, providerQuotaResourceResponse{
+		NominalAccounts: map[string]providerQuotaAccount{
+			match.account: normalizeProviderQuotaAccount(match.provider, query.quota),
+		},
+	})
+}
+
+type cpaQuotaQueryResult struct {
+	quota  pluginapi.QuotaFetchResponse
+	status int
+}
+
+func queryCPAManagementQuota(ctx context.Context, snapshot CPAConfigSnapshot, managementKey, authIndex, provider string) (cpaQuotaQueryResult, error) {
+	return retryQuotaRead(ctx, func() (cpaQuotaQueryResult, error) {
+		endpoint, errURL := deriveManagementQuotaURL(snapshot)
+		if errURL != nil {
+			return cpaQuotaQueryResult{}, errURL
+		}
+		body, errMarshal := json.Marshal(map[string]string{"auth_index": authIndex, "provider": provider})
+		if errMarshal != nil {
+			return cpaQuotaQueryResult{}, errMarshal
+		}
+		requestCtx, cancel := context.WithTimeout(ctx, quotaManagementTimeout)
+		defer cancel()
+		request, errRequest := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, strings.NewReader(string(body)))
+		if errRequest != nil {
+			return cpaQuotaQueryResult{}, errRequest
+		}
+		request.Header.Set("Authorization", "Bearer "+managementKey)
+		request.Header.Set("Content-Type", "application/json")
+
+		// Keep the configured host for HTTP Host/TLS verification, but force the
+		// TCP connection to loopback. This prevents a CPA config hostname from
+		// sending the Management Key to a remote host or an outbound proxy.
+		endpointURL, errParseURL := url.Parse(endpoint)
+		if errParseURL != nil {
+			return cpaQuotaQueryResult{}, errParseURL
+		}
+		expectedHost, expectedPort, errSplit := net.SplitHostPort(endpointURL.Host)
+		if errSplit != nil {
+			return cpaQuotaQueryResult{}, errSplit
+		}
+		loopbackHost := "127.0.0.1"
+		if ip := net.ParseIP(expectedHost); ip != nil && ip.IsLoopback() && strings.Contains(expectedHost, ":") {
+			loopbackHost = "::1"
+		}
+		dialer := &net.Dialer{Timeout: quotaManagementTimeout}
+		transport := &http.Transport{
+			Proxy: nil,
+			DialContext: func(dialCtx context.Context, network, address string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(address)
+				if err != nil || !strings.EqualFold(host, expectedHost) || port != expectedPort {
+					return nil, errors.New("refusing non-local CPA Management API redirect")
+				}
+				return dialer.DialContext(dialCtx, network, net.JoinHostPort(loopbackHost, expectedPort))
+			},
+		}
+		client := &http.Client{
+			Timeout:   quotaManagementTimeout,
+			Transport: transport,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		defer transport.CloseIdleConnections()
+		response, errDo := client.Do(request)
+		if errDo != nil {
+			return cpaQuotaQueryResult{}, errDo
+		}
+		defer response.Body.Close()
+		responseBody, errRead := io.ReadAll(io.LimitReader(response.Body, quotaManagementBodyMax+1))
+		if errRead != nil {
+			return cpaQuotaQueryResult{}, errRead
+		}
+		if len(responseBody) > quotaManagementBodyMax {
+			return cpaQuotaQueryResult{}, errors.New("CPA quota response exceeded size limit")
+		}
+		result := cpaQuotaQueryResult{status: response.StatusCode}
+		if response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError {
+			return result, fmt.Errorf("CPA quota endpoint returned HTTP %d", response.StatusCode)
+		}
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			return result, nil
+		}
+		if err := json.Unmarshal(responseBody, &result.quota); err != nil {
+			return cpaQuotaQueryResult{}, fmt.Errorf("decode CPA quota response: %w", err)
+		}
+		return result, nil
+	})
+}
+
+func deriveManagementQuotaURL(snapshot CPAConfigSnapshot) (string, error) {
+	modelsURL, err := deriveModelsURL(snapshot)
+	if err != nil {
+		return "", err
+	}
+	endpoint, err := url.Parse(modelsURL)
+	if err != nil {
+		return "", err
+	}
+	endpoint.Path = "/v0/management/quota/fetch"
+	endpoint.RawPath = ""
+	endpoint.RawQuery = ""
+	endpoint.Fragment = ""
+	return endpoint.String(), nil
 }
 
 func isQuotaDirectResourcePath(path string) bool {

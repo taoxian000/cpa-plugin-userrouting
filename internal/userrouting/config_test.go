@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPrefixMapAcceptsMappingAndJSONString(t *testing.T) {
@@ -165,18 +166,22 @@ func TestQuotaProviderConfigDefaultsAndOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode default config: %v", err)
 	}
-	if !defaultConfig.QuotaProvider.Enabled || !defaultConfig.QuotaProvider.PublicEndpoint {
-		t.Fatalf("quota provider defaults = %#v, want both enabled", defaultConfig.QuotaProvider)
+	if !defaultConfig.QuotaProvider.Enabled || !defaultConfig.QuotaProvider.PublicEndpoint || defaultConfig.QuotaCacheTTL != time.Minute {
+		t.Fatalf("quota provider defaults = %#v, cache TTL = %s; want both enabled and 1m cache", defaultConfig.QuotaProvider, defaultConfig.QuotaCacheTTL)
 	}
 
 	override := []byte("cpa_config_path: " + quotedYAML(path) + "\n" +
-		"quota_provider:\n  enabled: false\n  public_endpoint: false\n")
+		"quota_provider:\n  enabled: false\n  public_endpoint: false\n  cache_ttl: 0s\n")
 	configured, err := decodeRuntimeConfig(override, ConfigureOptions{})
 	if err != nil {
 		t.Fatalf("decode overridden config: %v", err)
 	}
-	if configured.QuotaProvider.Enabled || configured.QuotaProvider.PublicEndpoint {
-		t.Fatalf("quota provider override = %#v, want both disabled", configured.QuotaProvider)
+	if configured.QuotaProvider.Enabled || configured.QuotaProvider.PublicEndpoint || configured.QuotaCacheTTL != 0 {
+		t.Fatalf("quota provider override = %#v, cache TTL = %s; want disabled", configured.QuotaProvider, configured.QuotaCacheTTL)
+	}
+	invalid := []byte("cpa_config_path: " + quotedYAML(path) + "\nquota_provider:\n  cache_ttl: -1s\n")
+	if _, err := decodeRuntimeConfig(invalid, ConfigureOptions{}); err == nil {
+		t.Fatal("negative quota cache TTL should be rejected")
 	}
 }
 

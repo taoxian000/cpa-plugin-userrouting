@@ -93,9 +93,12 @@ type pluginConfig struct {
 // endpoint. It is enabled by default because the capability is read-only and
 // all public requests still require a valid CPA downstream API key.
 type quotaProviderConfig struct {
-	Enabled        bool `yaml:"enabled"`
-	PublicEndpoint bool `yaml:"public_endpoint"`
+	Enabled        bool   `yaml:"enabled"`
+	PublicEndpoint bool   `yaml:"public_endpoint"`
+	CacheTTL       string `yaml:"cache_ttl"`
 }
+
+const defaultQuotaCacheTTL = time.Minute
 
 // quotaFallbackConfig defines ordered model-prefix substitutions used only after
 // Codex reports a usage_limit_reached quota error.
@@ -113,6 +116,7 @@ type runtimeConfig struct {
 	IncludeDefaultPrefix        bool
 	QuotaFallback               quotaFallbackConfig
 	QuotaProvider               quotaProviderConfig
+	QuotaCacheTTL               time.Duration
 	StrictKeyValidation         bool
 	ModelsURL                   string
 	ModelCacheTTL               time.Duration
@@ -135,6 +139,7 @@ func decodeRuntimeConfig(raw []byte, opts ConfigureOptions) (runtimeConfig, erro
 		QuotaProvider: quotaProviderConfig{
 			Enabled:        true,
 			PublicEndpoint: true,
+			CacheTTL:       defaultQuotaCacheTTL.String(),
 		},
 		StrictKeyValidation: true,
 		ModelCacheTTL:       defaultModelCacheTTL.String(),
@@ -162,6 +167,10 @@ func decodeRuntimeConfig(raw []byte, opts ConfigureOptions) (runtimeConfig, erro
 		return runtimeConfig{}, err
 	}
 	lookupTimeout, err := parsePositiveDuration(cfg.ModelLookupTimeout, defaultModelLookupTimeout, "model_lookup_timeout")
+	if err != nil {
+		return runtimeConfig{}, err
+	}
+	quotaCacheTTL, err := parseNonNegativeDuration(cfg.QuotaProvider.CacheTTL, defaultQuotaCacheTTL, "quota_provider.cache_ttl")
 	if err != nil {
 		return runtimeConfig{}, err
 	}
@@ -202,6 +211,7 @@ func decodeRuntimeConfig(raw []byte, opts ConfigureOptions) (runtimeConfig, erro
 		IncludeDefaultPrefix:        cfg.IncludeDefaultPrefix,
 		QuotaFallback:               quotaFallback,
 		QuotaProvider:               cfg.QuotaProvider,
+		QuotaCacheTTL:               quotaCacheTTL,
 		StrictKeyValidation:         cfg.StrictKeyValidation,
 		ModelsURL:                   modelsURL,
 		ModelCacheTTL:               cacheTTL,

@@ -39,13 +39,21 @@ plugins:
             - "prefix_2"
             - "prefix_3"
 
-      # Register the Codex QuotaProvider and expose a public resource endpoint.
-      # The endpoint still requires a valid downstream CPA API key, but not the
-      # CPA Management Key. Set public_endpoint to false to keep only CPA's
-      # native Management API integration.
+      # Register the Codex QuotaProvider and expose public quota resources.
+      # Normal queries require a downstream CPA API key, not a Management Key.
+      # Optional ?provider=...&email=... lookup uses CPA's authenticated api-call
+      # route for Antigravity/Claude (like Management Center), and requires
+      # MANAGEMENT_PASSWORD in CPA's process environment.
+      # On current CPA, setting this also enables the entire Management API and
+      # permits remote auth attempts; restrict the management listener/firewall.
+      # Never put the Management Key in this plugin config or client request.
+      # Set public_endpoint to false to keep only CPA's native Management API.
       quota_provider:
         enabled: true
         public_endpoint: true
+        # Cache successful CPA auth_index quota reads for one minute. 0s disables.
+        # /quota/direct remains uncached; reset attempts invalidate Codex entries.
+        cache_ttl: "1m"
 
       # Usually empty: the plugin reads the same -config path used by CPA.
       cpa_config_path: ""

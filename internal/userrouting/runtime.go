@@ -39,6 +39,7 @@ type Runtime struct {
 	host                     HostCaller
 	config                   runtimeConfig
 	catalog                  *modelCatalog
+	quotaCache               quotaReadCache
 	deduplicatedModelsLoaded atomic.Bool
 }
 
