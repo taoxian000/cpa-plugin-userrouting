@@ -258,6 +258,7 @@ type quotaResourceResponse struct {
 type providerQuotaResourceResponse struct {
 	NominalAccounts map[string]providerQuotaAccount `json:"nominal_accounts"`
 	Partial         bool                            `json:"partial"`
+	Errors          []string                        `json:"errors,omitempty"`
 }
 
 type providerQuotaAccount struct {
@@ -382,7 +383,7 @@ func (r *Runtime) RegisterManagement() pluginapi.ManagementRegistrationResponse 
 		Resources: []pluginapi.ResourceRoute{
 			{
 				Path:        quotaResourcePath,
-				Description: "Query Codex quota by downstream CPA API key, or query a CPA credential by provider and email.",
+				Description: "Query Codex quota by downstream CPA API key, query one credential by provider and email, or query all Kiro credentials with provider=kiro.",
 			},
 			{
 				Path:        quotaDirectResourcePath,
@@ -431,6 +432,9 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 	}
 	provider := strings.TrimSpace(req.Query.Get("provider"))
 	email := strings.TrimSpace(req.Query.Get("email"))
+	if strings.EqualFold(provider, "kiro") && email == "" && !isQuotaResetResourcePath(req.Path) {
+		return r.handleAllKiroQuota(ctx, snapshot), nil
+	}
 	if provider != "" || email != "" {
 		if isQuotaResetResourcePath(req.Path) {
 			return quotaJSONResponse(http.StatusBadRequest, map[string]string{"error": "provider and email are supported only by the quota query route"}), nil

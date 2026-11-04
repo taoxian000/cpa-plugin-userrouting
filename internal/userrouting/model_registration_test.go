@@ -74,9 +74,55 @@ func TestRegisterModelsUsesLongestPrefix(t *testing.T) {
 	}
 }
 
+func TestRegisterModelsIncludesClaudeOnlyCloakedModels(t *testing.T) {
+	runtime := modelRegistrationRuntimeWithViews(t, map[string]struct {
+		status       int
+		models       []string
+		claudeStatus int
+		claudeModels []string
+	}{
+		"key-a": {
+			status:       http.StatusOK,
+			models:       []string{},
+			claudeModels: []string{"claude-fable-5-dd-los-6-tpg/a"},
+		},
+	})
+	response, err := runtime.RegisterModels(context.Background())
+	if err != nil {
+		t.Fatalf("RegisterModels() error = %v", err)
+	}
+	if got, want := registeredModelIDs(response.Models), []string{"gpt-6-sol"}; !equalStrings(got, want) {
+		t.Fatalf("registered models = %#v, want %#v", got, want)
+	}
+}
+
 func modelRegistrationRuntime(t *testing.T, responses map[string]struct {
 	status int
 	models []string
+}) *Runtime {
+	t.Helper()
+	views := make(map[string]struct {
+		status       int
+		models       []string
+		claudeStatus int
+		claudeModels []string
+	}, len(responses))
+	for key, response := range responses {
+		views[key] = struct {
+			status       int
+			models       []string
+			claudeStatus int
+			claudeModels []string
+		}{status: response.status, models: response.models}
+	}
+	return modelRegistrationRuntimeWithViews(t, views)
+}
+
+func modelRegistrationRuntimeWithViews(t *testing.T, responses map[string]struct {
+	status       int
+	models       []string
+	claudeStatus int
+	claudeModels []string
 }) *Runtime {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -89,12 +135,22 @@ func modelRegistrationRuntime(t *testing.T, responses map[string]struct {
 			http.Error(w, "unknown key", http.StatusUnauthorized)
 			return
 		}
-		if response.status != http.StatusOK {
-			http.Error(w, "catalog failed", response.status)
+		status := response.status
+		models := response.models
+		if req.Header.Get("Anthropic-Version") != "" {
+			if response.claudeStatus != 0 {
+				status = response.claudeStatus
+			}
+			if response.claudeModels != nil {
+				models = response.claudeModels
+			}
+		}
+		if status != http.StatusOK {
+			http.Error(w, "catalog failed", status)
 			return
 		}
-		data := make([]map[string]string, 0, len(response.models))
-		for _, model := range response.models {
+		data := make([]map[string]string, 0, len(models))
+		for _, model := range models {
 			data = append(data, map[string]string{"id": model})
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": data})

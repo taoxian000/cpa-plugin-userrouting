@@ -51,6 +51,48 @@ func TestResolvePreservesThinkingSuffixDuringCatalogLookup(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeSubagentAndResponsesUseSamePrefixForSameKeyAndModel(t *testing.T) {
+	runtime, _ := testRuntime(t, []string{"team-a/gpt-6-sol", "fallback/gpt-6-sol"})
+	requests := []struct {
+		format  string
+		headers http.Header
+		body    []byte
+	}{
+		{format: "claude", headers: http.Header{"X-Api-Key": []string{"key-1"}}, body: []byte(`{"model":"gpt-6-sol","messages":[{"role":"user","content":"hi"}]}`)},
+		{format: "openai-response", headers: bearerHeader("key-1"), body: []byte(`{"model":"gpt-6-sol","input":"hi"}`)},
+	}
+	for _, request := range requests {
+		t.Run(request.format, func(t *testing.T) {
+			route, err := runtime.Route(pluginapi.ModelRouteRequest{
+				SourceFormat: request.format, RequestedModel: "gpt-6-sol", Headers: request.headers,
+			}, "")
+			if err != nil || !route.Handled || route.TargetKind != pluginapi.ModelRouteTargetSelf {
+				t.Fatalf("Route() = (%#v, %v), want self executor", route, err)
+			}
+			_, err = runtime.Execute(context.Background(), pluginapi.ExecutorRequest{
+				Model: "gpt-6-sol", SourceFormat: request.format, Format: request.format,
+				Headers: request.headers, OriginalRequest: request.body,
+			}, "")
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			call := runtime.host.(*fakeHost).call(pluginabi.MethodHostModelExecute)
+			if got := gjson.GetBytes(call, "model").String(); got != "team-a/gpt-6-sol" {
+				t.Fatalf("host model = %q, want team-a/gpt-6-sol", got)
+			}
+			var hostRequest struct {
+				Body []byte `json:"body"`
+			}
+			if err := json.Unmarshal(call, &hostRequest); err != nil {
+				t.Fatalf("decode host call: %v", err)
+			}
+			if got := gjson.GetBytes(hostRequest.Body, "model").String(); got != "team-a/gpt-6-sol" {
+				t.Fatalf("rewritten request model = %q", got)
+			}
+		})
+	}
+}
+
 func TestRouteDeclinesCountTokensAndUnchangedDefault(t *testing.T) {
 	path := writeCPAConfig(t, "key-1")
 	host := &fakeHost{}

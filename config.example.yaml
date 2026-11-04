@@ -44,6 +44,9 @@ plugins:
       # Optional ?provider=...&email=... lookup uses CPA's authenticated api-call
       # route for Antigravity/Claude (like Management Center), and requires
       # MANAGEMENT_PASSWORD in CPA's process environment.
+      # ?provider=kiro without email aggregates every available Kiro account
+      # via an installed Kiro plugin's native QuotaProvider; it also requires
+      # MANAGEMENT_PASSWORD and exposes all Kiro account labels to valid keys.
       # On current CPA, setting this also enables the entire Management API and
       # permits remote auth attempts; restrict the management listener/firewall.
       # Never put the Management Key in this plugin config or client request.

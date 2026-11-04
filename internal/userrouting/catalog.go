@@ -23,6 +23,10 @@ type modelCatalog struct {
 	internalBypassToken  string
 
 	mu        sync.Mutex
+	snapshots map[string]modelCatalogSnapshot
+}
+
+type modelCatalogSnapshot struct {
 	expiresAt time.Time
 	models    map[string]struct{}
 }
@@ -73,26 +77,37 @@ func (c *modelCatalog) Models(ctx context.Context, apiKey string) (map[string]st
 	if c == nil {
 		return nil, fmt.Errorf("model catalog is unavailable")
 	}
-	return c.fetch(ctx, apiKey)
+	return c.fetch(ctx, apiKey, false)
+}
+
+// ClaudeModels reads CPA's Anthropic-format catalog. It can contain models
+// absent from the OpenAI-format catalog, and CPA may cloak their IDs.
+func (c *modelCatalog) ClaudeModels(ctx context.Context, apiKey string) (map[string]struct{}, error) {
+	if c == nil {
+		return nil, fmt.Errorf("model catalog is unavailable")
+	}
+	return c.fetch(ctx, apiKey, true)
 }
 
 func (c *modelCatalog) snapshot(ctx context.Context, apiKey string) (map[string]struct{}, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.models) > 0 && c.ttl > 0 && time.Now().Before(c.expiresAt) {
-		return c.models, nil
+	if snapshot, exists := c.snapshots[apiKey]; exists && len(snapshot.models) > 0 && c.ttl > 0 && time.Now().Before(snapshot.expiresAt) {
+		return snapshot.models, nil
 	}
 
-	models, err := c.fetch(ctx, apiKey)
+	models, err := c.fetch(ctx, apiKey, false)
 	if err != nil {
 		return nil, err
 	}
-	c.models = models
-	c.expiresAt = time.Now().Add(c.ttl)
+	if c.snapshots == nil {
+		c.snapshots = make(map[string]modelCatalogSnapshot)
+	}
+	c.snapshots[apiKey] = modelCatalogSnapshot{expiresAt: time.Now().Add(c.ttl), models: models}
 	return models, nil
 }
 
-func (c *modelCatalog) fetch(ctx context.Context, apiKey string) (map[string]struct{}, error) {
+func (c *modelCatalog) fetch(ctx context.Context, apiKey string, claude bool) (map[string]struct{}, error) {
 	lookupCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(lookupCtx, http.MethodGet, c.url, nil)
@@ -101,6 +116,9 @@ func (c *modelCatalog) fetch(ctx context.Context, apiKey string) (map[string]str
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
+	if claude {
+		req.Header.Set("Anthropic-Version", "2023-06-01")
+	}
 	req.Header.Set(c.internalBypassHeader, c.internalBypassToken)
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -122,6 +140,9 @@ func (c *modelCatalog) fetch(ctx context.Context, apiKey string) (map[string]str
 	models := make(map[string]struct{}, len(payload.Data))
 	for _, item := range payload.Data {
 		id := strings.TrimSpace(item.ID)
+		if claude {
+			id = decodeClaudeCatalogModelID(id)
+		}
 		if id != "" {
 			models[id] = struct{}{}
 		}

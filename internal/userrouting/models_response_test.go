@@ -90,6 +90,66 @@ func TestInterceptResponseHandlesGeminiModelsField(t *testing.T) {
 	}
 }
 
+func TestInterceptResponseFiltersClaudeCloakedSourceModels(t *testing.T) {
+	runtime := modelRegistrationRuntime(t, map[string]struct {
+		status int
+		models []string
+	}{
+		"key-a": {status: http.StatusOK, models: []string{"a/gpt-6-sol"}},
+	})
+	runtime.config.RegisterDeduplicatedModels = true
+	runtime.config.HidePrefixedModels = true
+	if _, err := runtime.RegisterModels(context.Background()); err != nil {
+		t.Fatalf("RegisterModels() error = %v", err)
+	}
+	response, err := runtime.InterceptResponse(context.Background(), pluginapi.ResponseInterceptRequest{
+		SourceFormat: "claude",
+		StatusCode:   http.StatusOK,
+		Body:         []byte(`{"data":[{"id":"claude-fable-5-dd-los-6-tpg/a"},{"id":"claude-fable-5-dd-los-6-tpg"},{"id":"claude-fable-5-dd-los-6-tpg/b"},{"id":"claude-haiku-4.5"}],"first_id":"claude-fable-5-dd-los-6-tpg/a","last_id":"claude-haiku-4.5","has_more":false}`),
+	})
+	if err != nil {
+		t.Fatalf("InterceptResponse() error = %v", err)
+	}
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+		FirstID string `json:"first_id"`
+		LastID  string `json:"last_id"`
+	}
+	if err := json.Unmarshal(response.Body, &payload); err != nil {
+		t.Fatalf("decode rewritten response: %v", err)
+	}
+	if len(payload.Data) != 2 || payload.Data[0].ID != "claude-fable-5-dd-los-6-tpg" || payload.Data[1].ID != "claude-haiku-4.5" {
+		t.Fatalf("remaining Claude models = %#v", payload.Data)
+	}
+	if payload.FirstID != payload.Data[0].ID || payload.LastID != payload.Data[1].ID {
+		t.Fatalf("Claude pagination boundaries = (%q, %q)", payload.FirstID, payload.LastID)
+	}
+}
+
+func TestInterceptResponseKeepsPrefixedModelWithoutVisibleReplacement(t *testing.T) {
+	runtime := modelRegistrationRuntime(t, map[string]struct {
+		status int
+		models []string
+	}{
+		"key-a": {status: http.StatusOK, models: []string{"a/gpt-6-sol"}},
+	})
+	runtime.config.RegisterDeduplicatedModels = true
+	runtime.config.HidePrefixedModels = true
+	if _, err := runtime.RegisterModels(context.Background()); err != nil {
+		t.Fatalf("RegisterModels() error = %v", err)
+	}
+	response, err := runtime.InterceptResponse(context.Background(), pluginapi.ResponseInterceptRequest{
+		SourceFormat: "claude",
+		StatusCode:   http.StatusOK,
+		Body:         []byte(`{"data":[{"id":"claude-fable-5-dd-los-6-tpg/a"}]}`),
+	})
+	if err != nil || len(response.Body) != 0 {
+		t.Fatalf("response = (%q, %v), want original catalog without visible replacement", response.Body, err)
+	}
+}
+
 func TestInterceptResponseIsNoopUnlessEnabledForModelLists(t *testing.T) {
 	runtime := modelRegistrationRuntime(t, map[string]struct {
 		status int

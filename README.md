@@ -20,13 +20,13 @@
 4. 改写 JSON 请求体中的顶层 `model`，再通过 CPA 原生模型执行链路发送请求。
 5. CPA 主日志记录 `requested_model`、最终 `model` 和 `used_default`；上游凭证选择和用量记录也使用最终模型。
 
-插件不会把 API Key 写入日志。模型目录默认缓存 5 秒。
+插件不会把 API Key 写入日志。模型目录按下游 API Key 分别缓存，默认缓存 5 秒，避免不同 Key 的目录互相影响。
 
 ### 去重模型注册
 
 默认关闭。启用 `register_deduplicated_models` 后，插件会通过 CPA 的模型注册能力，额外注册去掉配置前缀并去重后的模型名。`include_default_prefix` 默认开启，非空的 `default` 前缀也会参与剥离；关闭后只使用各 API Key 对应的前缀。该能力需要 CPA v7.2.155 或更高版本。
 
-可选的 `hide_prefixed_models: true` 会在模型目录响应中隐藏这些配置前缀对应的原始带前缀模型，仅显示去重后的无前缀模型；它依赖 `register_deduplicated_models: true`。插件会先完成模型发现，再启用目录过滤；如果没有发现任何可注册的去重模型，则保持原目录不变，避免把目录过滤空。这只是目录展示过滤，不会从 CPA 注册表删除模型，手动请求带前缀模型仍可正常路由。该过滤通过 CPA 的响应拦截器实现，需要支持 `response_interceptor` 插件能力的 CPA 版本。
+可选的 `hide_prefixed_models: true` 会在模型目录响应中隐藏这些配置前缀对应的原始带前缀模型，仅显示去重后的无前缀模型；它依赖 `register_deduplicated_models: true`。插件会分别发现普通与 Claude 格式目录中的模型，识别 CPA 对 Claude 目录模型 ID 的伪装形式，并在同一份响应中存在无前缀替代项时隐藏原项；没有替代项时保留原项，避免把目录过滤空。Claude 格式响应的 `first_id`、`last_id` 也会随过滤更新。这只是目录展示过滤，不会从 CPA 注册表删除模型，手动请求带前缀模型仍可正常路由。该过滤通过 CPA 的响应拦截器实现，需要支持 `response_interceptor` 插件能力的 CPA 版本。
 
 已知问题：本插件目前不能与 [cpa-plugin-codexcomp](https://github.com/uf-hy/cpa-plugin-codexcomp) 同时启用，否则 Codex 的 WebSocket 请求可能因响应流未收到 `response.completed` 而返回 408。
 
@@ -65,9 +65,18 @@ GET /v0/resource/plugins/user-routing/quota?provider=antigravity&email=account@e
 Authorization: Bearer <CPA 下游 API Key>
 ```
 
-`provider` 和 `email` 必须同时提供；省略或都为空时保持上面的原 Codex 前缀查询逻辑。指定查询仍要求有效的下游 API Key，但不受该 Key 的模型前缀或 `quota_fallback` 范围限制：持有任意有效下游 Key 的客户端都可以按 Provider 和邮箱查询任意可用认证文件的额度。请仅向可信客户端发放 CPA 下游 API Key。Provider 和邮箱按不区分大小写匹配；若匹配到多份认证文件会返回 409。插件先通过 CPA 插件 ABI 获取匹配认证的 `auth_index`，然后通过 CPA Management Center 使用的 `POST /v8/management/requests/api-call` 路由查询 Antigravity 和 Claude：Antigravity 查询 `retrieveUserQuotaSummary` 并补充 `loadCodeAssist` 订阅信息，Claude 查询 OAuth `usage` 并尽力补充 `profile`。因此，即使 CPA 没有为这些 Provider 实现原生 `QuotaProvider`，也能按对应官方接口查询。其他 Provider 仍使用 CPA 原生 `POST /v0/management/quota/fetch`，需要 CPA 自身提供 quota provider 或 `quota_probe`。
+通常 `provider` 和 `email` 必须同时提供；省略或都为空时保持上面的原 Codex 前缀查询逻辑。例外：`provider=kiro` 且不带 `email` 会查询全部可用 Kiro 认证。指定查询仍要求有效的下游 API Key，但不受该 Key 的模型前缀或 `quota_fallback` 范围限制：持有任意有效下游 Key 的客户端都可以查询这些账户的额度。请仅向可信客户端发放 CPA 下游 API Key。Provider 和邮箱按不区分大小写匹配；单账户查询若匹配到多份认证文件会返回 409。插件先通过 CPA 插件 ABI 获取匹配认证的 `auth_index`，然后通过 CPA Management Center 使用的 `POST /v8/management/requests/api-call` 路由查询 Antigravity 和 Claude：Antigravity 查询 `retrieveUserQuotaSummary` 并补充 `loadCodeAssist` 订阅信息，Claude 查询 OAuth `usage` 并尽力补充 `profile`。因此，即使 CPA 没有为这些 Provider 实现原生 `QuotaProvider`，也能按对应官方接口查询。其他 Provider 仍使用 CPA 原生 `POST /v0/management/quota/fetch`，需要 CPA 自身提供 quota provider 或 `quota_probe`。
 
 指定 Provider 的成功响应与 Codex 使用相同的 `nominal_accounts` 邮箱字典及账户内的 `subscription`、`summary`、`groups[].buckets[]` 字段，并返回 `partial: false`。此查询不选择模型前缀，因此不返回 `nominal_prefix`、`actual_prefix` 或 `actual_accounts`。Claude 的 `five-hour`/`seven-day`、Antigravity 的 `5h`/`weekly` 分别映射为通用的 `primary`/`secondary`，原始窗口名保存在 `sourceWindow`。Antigravity 的 “Gemini Models” 和 “Claude and GPT models” 两个分组均完整保留，每组的 5 小时和每周额度共四个 `remainingFraction` 值不会合并或丢弃。非 Codex Provider 没有 Codex 专用的 `reset_credits` 字段。
+
+查询所有 Kiro 账户：
+
+```text
+GET /v0/resource/plugins/user-routing/quota?provider=kiro
+Authorization: Bearer <CPA 下游 API Key>
+```
+
+此接口调用 CPA 原生 `quota/fetch`，复用已安装并启用的 [Kiro 插件](https://github.com/nguyenha935/kiro-cpa-plugin) 的 `QuotaProvider`；本插件不直接处理 AWS token 或复制 Kiro 的区域/认证逻辑。响应中的每个账户保留订阅信息和 `summary`，`groups` 统一为一个 `Kiro` 分组、一个 `monthly` 额度条，包含 `remainingFraction`、`resetTime` 和原使用量描述。账户字典优先以邮箱为键；没有邮箱时使用标签/文件名/`auth_index`，重复邮箱则在后一个账户键后附 `auth_index`。部分账户查询失败时返回可用账户并标记 `partial: true`；全部失败时返回 502；没有可用 Kiro 认证时返回空账户字典。通常需要 Kiro 插件注册原生额度 Provider（或为认证配置 CPA `quota_probe`）才能查询成功；查询所有账户意味着任意有效 CPA 下游 Key 都能看到这些账户的邮箱和额度。
 
 这个分支需要在 CPA 进程环境中设置 `MANAGEMENT_PASSWORD`。无需尝试从配置文件中的 bcrypt hash 还原原密码：可以为该服务设置一把新的强随机 Management Key，CPA 会将它作为环境密钥接受，原配置 hash 可保留。插件不会读取或破解 hash，也不会把 key 放入插件配置或客户端请求；若环境变量未设置，此分支返回 503，而原 Codex 查询照常工作。建议通过权限为 `0600` 的 systemd `EnvironmentFile` 注入该环境变量。
 
@@ -124,7 +133,7 @@ quota_provider:
   cache_ttl: "1m"
 ```
 
-`cache_ttl` 默认 `1m`，按 CPA 认证文件的 `provider + auth_index` 缓存成功的额度查询；认证内容变化会使缓存失效，同一认证的并发查询会合并。Codex 常规 `/quota` 将用量和重置次数明细作为一个结果缓存，原生 `quota.fetch` 也缓存用量；Claude/Antigravity 的 `provider+email` 查询缓存完整账户额度。认证列表与下游 Key 验证仍每次执行。查询错误及不完整的 Codex 重置次数详情不缓存。Codex 重置请求发出前清除对应认证缓存；`/quota/direct/reset` 因没有 CPA `auth_index`，会清除全部 Codex 认证缓存。`/quota/direct` 始终实时查询，不使用此缓存。设为 `0s` 可关闭缓存；缓存可能使额度与跨前缀选择最多滞后一个 TTL。该缓存不影响模型目录的 `model_cache_ttl`。
+`cache_ttl` 默认 `1m`，按 CPA 认证文件的 `provider + auth_index` 缓存成功的额度查询；认证内容变化会使缓存失效，同一认证的并发查询会合并。Codex 常规 `/quota` 将用量和重置次数明细作为一个结果缓存，原生 `quota.fetch` 也缓存用量；Claude/Antigravity 的 `provider+email` 查询及 Kiro 全账户查询按认证文件缓存成功额度。认证列表与下游 Key 验证仍每次执行。查询错误及不完整的 Codex 重置次数详情不缓存。Codex 重置请求发出前清除对应认证缓存；`/quota/direct/reset` 因没有 CPA `auth_index`，会清除全部 Codex 认证缓存。`/quota/direct` 始终实时查询，不使用此缓存。设为 `0s` 可关闭缓存；缓存可能使额度与跨前缀选择最多滞后一个 TTL。该缓存不影响模型目录的 `model_cache_ttl`。
 
 `public_endpoint: false` 时仍保留 CPA 原生 `QuotaProvider` 能力，但不注册公开查询和重置资源接口。Codex 用量和重置额度详情分别通过 ChatGPT/Codex 的 `/backend-api/wham/usage` 与 `/backend-api/wham/rate-limit-reset-credits` 读取，消费则调用对应的 `/consume` 接口；这些上游接口格式可能变化。[Codex 上游客户端实现](https://github.com/openai/codex/blob/main/codex-rs/backend-client/src/client/rate_limit_resets.rs)
 

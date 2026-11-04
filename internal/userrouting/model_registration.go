@@ -43,29 +43,31 @@ func (r *Runtime) RegisterModels(ctx context.Context) (pluginapi.ModelRegistrati
 
 	models := make(map[string]pluginapi.ModelInfo)
 	for _, key := range keys {
-		catalog, err := r.catalog.Models(ctx, key)
-		if err != nil {
-			continue
-		}
-		modelIDs := make([]string, 0, len(catalog))
-		for modelID := range catalog {
-			modelIDs = append(modelIDs, modelID)
-		}
-		sort.Strings(modelIDs)
-		for _, modelID := range modelIDs {
-			base, ok := stripModelPrefix(modelID, prefixes)
-			if !ok || base == "" {
+		for _, readCatalog := range []func(context.Context, string) (map[string]struct{}, error){r.catalog.Models, r.catalog.ClaudeModels} {
+			catalog, err := readCatalog(ctx, key)
+			if err != nil {
 				continue
 			}
-			if _, exists := models[base]; exists {
-				continue
+			modelIDs := make([]string, 0, len(catalog))
+			for modelID := range catalog {
+				modelIDs = append(modelIDs, modelID)
 			}
-			models[base] = pluginapi.ModelInfo{
-				ID:          base,
-				Object:      "model",
-				OwnedBy:     modelRegistrationProvider,
-				Name:        base,
-				DisplayName: base,
+			sort.Strings(modelIDs)
+			for _, modelID := range modelIDs {
+				base, ok := stripModelPrefix(modelID, prefixes)
+				if !ok || base == "" {
+					continue
+				}
+				if _, exists := models[base]; exists {
+					continue
+				}
+				models[base] = pluginapi.ModelInfo{
+					ID:          base,
+					Object:      "model",
+					OwnedBy:     modelRegistrationProvider,
+					Name:        base,
+					DisplayName: base,
+				}
 			}
 		}
 	}

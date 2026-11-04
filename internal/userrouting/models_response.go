@@ -18,14 +18,14 @@ func (r *Runtime) InterceptResponse(_ context.Context, req pluginapi.ResponseInt
 	if r.catalog.isInternalRequest(req.RequestHeaders) {
 		return pluginapi.ResponseInterceptResponse{}, nil
 	}
-	body, changed := removePrefixedModelEntries(req.Body, r.deduplicationPrefixes())
+	body, changed := removePrefixedModelEntries(req.Body, r.deduplicationPrefixes(), req.SourceFormat)
 	if !changed {
 		return pluginapi.ResponseInterceptResponse{}, nil
 	}
 	return pluginapi.ResponseInterceptResponse{Body: body}, nil
 }
 
-func removePrefixedModelEntries(body []byte, prefixes []string) ([]byte, bool) {
+func removePrefixedModelEntries(body []byte, prefixes []string, sourceFormat string) ([]byte, bool) {
 	if len(body) == 0 || len(prefixes) == 0 {
 		return body, false
 	}
@@ -44,16 +44,24 @@ func removePrefixedModelEntries(body []byte, prefixes []string) ([]byte, bool) {
 		if err := json.Unmarshal(raw, &entries); err != nil {
 			continue
 		}
+		visibleModels := make(map[string]struct{}, len(entries))
+		for _, entry := range entries {
+			if model := modelListEntryID(entry, sourceFormat); model != "" {
+				visibleModels[model] = struct{}{}
+			}
+		}
 		filtered := make([]json.RawMessage, 0, len(entries))
 		fieldChanged := false
 		for _, entry := range entries {
-			if isPrefixedModelEntry(entry, prefixes) {
-				fieldChanged = true
-				continue
+			if base, hasPrefix := stripModelPrefix(modelListEntryID(entry, sourceFormat), prefixes); hasPrefix {
+				if _, hasReplacement := visibleModels[base]; hasReplacement {
+					fieldChanged = true
+					continue
+				}
 			}
 			filtered = append(filtered, entry)
 		}
-		if !fieldChanged {
+		if !fieldChanged || len(filtered) == 0 {
 			continue
 		}
 		encoded, err := json.Marshal(filtered)
@@ -61,6 +69,10 @@ func removePrefixedModelEntries(body []byte, prefixes []string) ([]byte, bool) {
 			continue
 		}
 		payload[field] = encoded
+		if field == "data" {
+			updateModelListBoundary(payload, "first_id", filtered[0])
+			updateModelListBoundary(payload, "last_id", filtered[len(filtered)-1])
+		}
 		changed = true
 	}
 	if !changed {
@@ -73,22 +85,35 @@ func removePrefixedModelEntries(body []byte, prefixes []string) ([]byte, bool) {
 	return encoded, true
 }
 
-func isPrefixedModelEntry(entry json.RawMessage, prefixes []string) bool {
-	var model map[string]json.RawMessage
-	if err := json.Unmarshal(entry, &model); err != nil || model == nil {
-		return false
+func modelListEntryID(entry json.RawMessage, sourceFormat string) string {
+	var model struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
 	}
-	for _, field := range []string{"id", "name"} {
-		var value string
-		if err := json.Unmarshal(model[field], &value); err != nil {
-			continue
-		}
-		value = strings.TrimPrefix(strings.TrimSpace(value), "models/")
-		for _, prefix := range prefixes {
-			if prefix != "" && strings.HasPrefix(value, prefix) {
-				return true
-			}
-		}
+	if json.Unmarshal(entry, &model) != nil {
+		return ""
 	}
-	return false
+	id := strings.TrimSpace(model.ID)
+	if id == "" {
+		id = strings.TrimSpace(model.Name)
+	}
+	if strings.EqualFold(sourceFormat, "claude") {
+		id = decodeClaudeCatalogModelID(id)
+	}
+	return strings.TrimPrefix(id, "models/")
+}
+
+func updateModelListBoundary(payload map[string]json.RawMessage, field string, entry json.RawMessage) {
+	if _, exists := payload[field]; !exists {
+		return
+	}
+	var model struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(entry, &model) != nil {
+		return
+	}
+	if encoded, err := json.Marshal(model.ID); err == nil {
+		payload[field] = encoded
+	}
 }
