@@ -119,6 +119,7 @@ func (c *quotaReadCache) get(ctx context.Context, key quotaCacheKey, ttl time.Du
 	c.inFlight[key] = flight
 	c.mu.Unlock()
 
+	startedAt := time.Now()
 	value, cacheable, err := load()
 	c.mu.Lock()
 	flight.value, flight.err = value, err
@@ -144,12 +145,36 @@ func (c *quotaReadCache) get(ctx context.Context, key quotaCacheKey, ttl time.Du
 				}
 				delete(c.entries, oldestKey)
 			}
-			c.entries[key] = quotaCacheEntry{value: value, expiresAt: now.Add(ttl)}
+			c.entries[key] = quotaCacheEntry{value: value, expiresAt: value.expiry(key.kind, startedAt, now.Add(ttl))}
 		}
 	}
 	close(flight.done)
 	c.mu.Unlock()
 	return value, err
+}
+
+// An exhausted Codex window can recover before the configured cache TTL.
+// Requery at its reset time instead of extending the fallback with stale data.
+func (v quotaCacheValue) expiry(kind string, startedAt, expiresAt time.Time) time.Time {
+	var groups []pluginapi.QuotaGroup
+	switch kind {
+	case quotaCacheCodexResource:
+		groups = v.account.Groups
+	case quotaCacheCodexNative:
+		groups = v.native.Groups
+	}
+	for _, group := range groups {
+		for _, bucket := range group.Buckets {
+			if bucket.RemainingFraction > 0 {
+				continue
+			}
+			resetAt, err := time.Parse(time.RFC3339, bucket.ResetTime)
+			if err == nil && resetAt.After(startedAt) && resetAt.Before(expiresAt) {
+				expiresAt = resetAt
+			}
+		}
+	}
+	return expiresAt
 }
 
 // invalidate removes all cache entries and in-flight bindings for one CPA

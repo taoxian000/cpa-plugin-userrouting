@@ -107,6 +107,54 @@ func TestDescribeQuotaAdvertisesReset(t *testing.T) {
 	}
 }
 
+func TestExhaustedCodexQuotaCacheExpiresAtReset(t *testing.T) {
+	start := time.Unix(1900000000, 0).UTC()
+	reset := start.Add(time.Minute)
+	ttlDeadline := start.Add(time.Hour)
+	value := quotaCacheValue{account: quotaResourceAccount{QuotaFetchResponse: pluginapi.QuotaFetchResponse{
+		Groups: []pluginapi.QuotaGroup{{Buckets: []pluginapi.QuotaBucket{
+			{RemainingFraction: 0.5, ResetTime: start.Add(time.Second).Format(time.RFC3339)},
+			{RemainingFraction: 0, ResetTime: reset.Format(time.RFC3339)},
+		}}},
+	}}}
+	if got := value.expiry(quotaCacheCodexResource, start, ttlDeadline); !got.Equal(reset) {
+		t.Fatalf("expiry = %s, want %s", got, reset)
+	}
+	if got := value.expiry(quotaCacheCodexResource, reset, ttlDeadline); !got.Equal(ttlDeadline) {
+		t.Fatalf("expiry of a fresh result with an elapsed reset = %s, want %s", got, ttlDeadline)
+	}
+}
+
+func TestQuotaResourceReturnsToNominalAfterCPACooldown(t *testing.T) {
+	host := &quotaResourceHost{auths: map[string]quotaTestAuth{
+		"nominal": {prefix: "primary", email: "one@example.com", token: "token-1", remaining: 0.8, unavailable: true, retryAt: time.Now().Add(time.Hour)},
+		"backup":  {prefix: "backup", email: "two@example.com", token: "token-2", remaining: 0.5},
+	}}
+	r := &Runtime{host: host, config: runtimeConfig{
+		Enabled: true, PrefixMap: PrefixMap{"key-1": "primary/"}, CPAConfig: NewCPAConfigReader(writeCPAConfig(t, "key-1")),
+		QuotaFallback: quotaFallbackConfig{Enabled: true, Prefixes: map[string][]string{"primary": {"backup"}}},
+		QuotaProvider: quotaProviderConfig{Enabled: true, PublicEndpoint: true},
+	}}
+	query := func(want string) quotaResourceResponse {
+		t.Helper()
+		resp, err := r.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+			Method: http.MethodGet, Headers: bearerHeader("key-1"), Path: "/v0/resource/plugins/user-routing/quota",
+		}, "callback-1")
+		var result quotaResourceResponse
+		if err != nil || resp.StatusCode != http.StatusOK || json.Unmarshal(resp.Body, &result) != nil || result.ActualPrefix != want {
+			t.Fatalf("want actual_prefix %q; status=%d err=%v body=%s", want, resp.StatusCode, err, resp.Body)
+		}
+		return result
+	}
+	query("backup/")
+	nominal := host.auths["nominal"]
+	nominal.retryAt = time.Now().Add(-time.Second)
+	host.auths["nominal"] = nominal // CPA has not cleared unavailable yet.
+	if got := query("primary/"); len(got.NominalAccounts) != 1 || len(got.ActualAccounts) != 0 {
+		t.Fatalf("unexpected accounts after recovery: %+v", got)
+	}
+}
+
 func TestQuotaResourceReturnsNominalAndActualPrefixes(t *testing.T) {
 	path := writeCPAConfig(t, "key-1")
 	host := &quotaResourceHost{
@@ -793,6 +841,8 @@ func TestResetQuotaDoesNotConsumeWithoutCredits(t *testing.T) {
 }
 
 type quotaTestAuth struct {
+	unavailable        bool
+	retryAt            time.Time
 	provider           string
 	prefix             string
 	email              string
@@ -828,7 +878,7 @@ func (h *quotaResourceHost) Call(method string, payload any) (json.RawMessage, e
 			if provider == "" {
 				provider = quotaCodexProvider
 			}
-			files = append(files, pluginapi.HostAuthFileEntry{AuthIndex: index, ID: index, Provider: provider, Email: auth.email, ProjectID: auth.projectID})
+			files = append(files, pluginapi.HostAuthFileEntry{AuthIndex: index, ID: index, Provider: provider, Email: auth.email, ProjectID: auth.projectID, Unavailable: auth.unavailable, NextRetryAfter: auth.retryAt})
 		}
 		return json.Marshal(hostAuthListResponse{Files: files})
 	case pluginabi.MethodHostAuthGet:

@@ -137,6 +137,8 @@ quota_provider:
 
 `public_endpoint: false` 时仍保留 CPA 原生 `QuotaProvider` 能力，但不注册公开查询和重置资源接口。Codex 用量和重置额度详情分别通过 ChatGPT/Codex 的 `/backend-api/wham/usage` 与 `/backend-api/wham/rate-limit-reset-credits` 读取，消费则调用对应的 `/consume` 接口；这些上游接口格式可能变化。[Codex 上游客户端实现](https://github.com/openai/codex/blob/main/codex-rs/backend-client/src/client/rate_limit_resets.rs)
 
+Codex 已耗尽的额度窗口若在缓存 TTL 内重置，缓存会在该窗口的重置时间失效。常规 `/quota` 在 CPA 的 `next_retry_after` 到期后会重新检查名义账户，即使 CPA 仍保留 `unavailable` 标记；没有重试时间的不可用账户仍会被跳过。
+
 支持的 API/协议：
 
 - OpenAI Chat Completions (`openai`)

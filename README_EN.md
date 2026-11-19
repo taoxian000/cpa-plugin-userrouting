@@ -137,6 +137,8 @@ quota_provider:
 
 With `public_endpoint: false`, CPA's native `QuotaProvider` integration remains available, but the public query and reset resource routes are not registered. Codex usage and reset-credit details are read from ChatGPT/Codex's `/backend-api/wham/usage` and `/backend-api/wham/rate-limit-reset-credits` endpoints; consumption calls the corresponding `/consume` endpoint. These upstream formats may change. See the [Codex upstream client implementation](https://github.com/openai/codex/blob/main/codex-rs/backend-client/src/client/rate_limit_resets.rs).
 
+If an exhausted Codex window resets before the cache TTL, the cached result expires at that reset time. The regular `/quota` endpoint rechecks the nominal account once CPA's `next_retry_after` has elapsed, even if CPA still reports `unavailable`. Unavailable accounts without a retry time are still skipped.
+
 Supported APIs/protocols:
 
 - OpenAI Chat Completions (`openai`)

@@ -272,13 +272,14 @@ func TestExecuteFallsBackAcrossPrefixesAfterCPAModelCooldown(t *testing.T) {
 		},
 	}
 
-	response, err := runtime.Execute(context.Background(), pluginapi.ExecutorRequest{
+	req := pluginapi.ExecutorRequest{
 		Model:           "gpt-5",
 		Format:          "openai",
 		SourceFormat:    "openai",
 		Headers:         bearerHeader("key-1"),
 		OriginalRequest: []byte(`{"model":"gpt-5","messages":[]}`),
-	}, "callback-1")
+	}
+	response, err := runtime.Execute(context.Background(), req, "callback-1")
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
@@ -287,6 +288,12 @@ func TestExecuteFallsBackAcrossPrefixesAfterCPAModelCooldown(t *testing.T) {
 	}
 	if got, want := host.models, []string{"team-a/gpt-5", "team-b/gpt-5"}; !equalStrings(got, want) {
 		t.Fatalf("host models = %#v, want %#v", got, want)
+	}
+	if _, err := runtime.Execute(context.Background(), req, "callback-2"); err != nil {
+		t.Fatalf("Execute() after recovery = %v", err)
+	}
+	if got, want := host.models, []string{"team-a/gpt-5", "team-b/gpt-5", "team-a/gpt-5"}; !equalStrings(got, want) {
+		t.Fatalf("host models after recovery = %#v, want %#v", got, want)
 	}
 }
 
@@ -447,17 +454,24 @@ func TestRunStreamFallsBackBeforeFirstPayloadAfterCPAModelCooldown(t *testing.T)
 		},
 	}
 
-	err := runtime.RunStream(context.Background(), pluginapi.ExecutorRequest{
+	req := pluginapi.ExecutorRequest{
 		Model:        "gpt-5",
 		Format:       "openai",
 		SourceFormat: "openai",
 		Headers:      bearerHeader("key-1"),
-	}, "callback-1", "plugin-stream")
+	}
+	err := runtime.RunStream(context.Background(), req, "callback-1", "plugin-stream")
 	if err != nil {
 		t.Fatalf("RunStream() error = %v", err)
 	}
 	if got, want := host.models, []string{"team-a/gpt-5", "team-b/gpt-5"}; !equalStrings(got, want) {
 		t.Fatalf("host models = %#v, want %#v", got, want)
+	}
+	if err := runtime.RunStream(context.Background(), req, "callback-2", "plugin-stream-2"); err != nil {
+		t.Fatalf("RunStream() after recovery = %v", err)
+	}
+	if got, want := host.models, []string{"team-a/gpt-5", "team-b/gpt-5", "team-a/gpt-5"}; !equalStrings(got, want) {
+		t.Fatalf("host models after recovery = %#v, want %#v", got, want)
 	}
 }
 

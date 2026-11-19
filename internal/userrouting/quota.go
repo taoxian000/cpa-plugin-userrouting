@@ -470,13 +470,14 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 	nominalPrefix = normalizePrefix(nominalName)
 	prefixResults := make([]quotaPrefixResult, 0, len(candidates))
 	actualPrefix := nominalPrefix
+	now := time.Now()
 	for _, candidate := range candidates {
 		prefixResult := quotaPrefixResult{
 			Prefix:   normalizePrefix(candidate),
 			Accounts: make(map[string]quotaResourceAccount),
 		}
 		for _, entry := range listed.Files {
-			if entry.Disabled || entry.Unavailable || !strings.EqualFold(strings.TrimSpace(entry.Provider), quotaCodexProvider) {
+			if entry.Disabled || authUnavailableAt(entry, now) || !strings.EqualFold(strings.TrimSpace(entry.Provider), quotaCodexProvider) {
 				continue
 			}
 			rawAuth, errGet := r.getAuthJSON(entry.AuthIndex)
@@ -990,6 +991,12 @@ func (r *Runtime) handleQuotaResetResource(ctx context.Context, nominalName stri
 	result.Success = failed == 0 && unresolved == 0 && len(result.NominalAccounts) == matched
 	result.Partial = succeeded > 0 && (failed > 0 || unresolved > 0)
 	return quotaJSONResponse(http.StatusOK, result)
+}
+
+// CPA may retain Unavailable after a timed cooldown has expired. Do not
+// exclude the credential from quota selection once CPA can retry it.
+func authUnavailableAt(entry pluginapi.HostAuthFileEntry, now time.Time) bool {
+	return entry.Unavailable && (entry.NextRetryAfter.IsZero() || entry.NextRetryAfter.After(now))
 }
 
 func quotaPrefixHasRemaining(prefix quotaPrefixResult) bool {
