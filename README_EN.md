@@ -1,207 +1,52 @@
 # CPA User Routing
 
-[中文](./README.md)/English
+[中文](./README.md) / English
 
-`user-routing` is a CLIProxyAPI dynamic plugin. It adds different model prefixes based on the downstream API key that has been authenticated against CPA's native `api-keys` list.
+`user-routing` is a plugin for [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI). **It lets different API keys use different pools of upstream accounts**, without clients having to change the model name.
 
-## Behavior
+## What problem does it solve?
 
-Configuration:
+Suppose you use model prefixes in CPA to separate account pools: `team-a/gpt-5` uses group A's accounts and `team-b/gpt-5` uses group B's. Normally each client would have to type the prefix itself to reach the right pool.
 
-```json
-{"apikey_1":"prefix_1/","apikey_2":"prefix_2/","default":""}
-```
+With this plugin installed:
 
-When a request uses model `gpt-5`:
+- User A requests `gpt-5` with their key, and the plugin rewrites it to `team-a/gpt-5`.
+- User B requests `gpt-5` with their key, and the plugin rewrites it to `team-b/gpt-5`.
+- For any other key, or when the model does not exist under that prefix, the `default` prefix is used (it can be empty, which keeps the original model name).
 
-1. The plugin extracts the API key from the request header or query parameter and verifies that it is present in CPA's `api-keys` list.
-2. If the key has a dedicated mapping, the plugin queries CPA's own `/v1/models` and checks whether, for example, `prefix_1/gpt-5` exists.
-3. If it exists, the dedicated prefix is used; otherwise the `default` prefix is used. A prefix may be empty.
-4. The top-level `model` in the JSON request body is rewritten, then the request is sent through CPA's native model-execution chain.
-5. CPA's main log records `requested_model`, the final `model`, and `used_default`. Upstream credential selection and usage accounting also use the final model.
+It also offers a few optional features:
 
-The plugin never writes API keys to its logs. Model catalogs are cached separately for each downstream API key for five seconds by default, preventing one key's catalog from affecting another.
+| Feature | In one sentence | Default |
+| --- | --- | --- |
+| [Hide prefixed models](#hide-prefixed-models) | The model list shows `gpt-5` instead of `team-a/gpt-5`, `team-b/gpt-5`, … | Off |
+| [Switch groups when quota runs out](#switch-groups-when-quota-runs-out) | When group A's Codex quota is exhausted, use group B automatically; optionally pick whom to borrow from by live quota | Off |
+| [Quota query and reset endpoints](#quota-query-and-reset-endpoints) | Check remaining account quota, or spend a reset credit, using an ordinary API key | On |
 
-### Deduplicated model registration
+## Quick start
 
-Disabled by default. When `register_deduplicated_models` is enabled, the plugin uses CPA's model registration capability to add deduplicated, unprefixed model names. `include_default_prefix` is enabled by default and includes a non-empty `default` prefix; disabling it limits stripping to API-key prefixes. This capability requires CPA v7.2.155 or later.
+### 1. Install
 
-The optional `hide_prefixed_models: true` hides original prefixed entries when an unprefixed replacement is visible in the same model-list response. It requires `register_deduplicated_models: true`. Discovery covers both regular and Claude-format catalogs; filtering recognizes CPA's cloaked Claude model IDs and updates Claude `first_id` and `last_id` after removal. Entries without visible replacements remain available, preventing an empty catalog. This filters catalog responses only; it does not remove models from CPA's registry, so direct requests using a prefixed model remain routable. Filtering uses CPA's response-interceptor capability and therefore requires a CPA version that supports `response_interceptor` plugins.
+Download the archive from [Releases](https://github.com/taoxian000/cpa-plugin-userrouting/releases) that matches CPA's platform and architecture, and put the library into CPA's plugin directory (the one `plugins.dir` points to):
 
-Known issue: this plugin currently cannot be enabled together with [cpa-plugin-codexcomp](https://github.com/uf-hy/cpa-plugin-codexcomp). Otherwise, Codex WebSocket requests may return 408 because the response stream does not receive `response.completed`.
+| Platform | File name |
+| --- | --- |
+| Linux | `user-routing.so` |
+| Windows | `user-routing.dll` |
+| macOS | `user-routing.dylib` |
 
-### Codex cross-prefix quota fallback
+> The plugin ID comes from the file name. **Do not rename the file**, or the `configs.user-routing` section below will not apply.
+>
+> CPA itself must be built with `CGO_ENABLED=1`; otherwise it cannot load shared-library plugins.
 
-This feature is disabled by default. When enabled, the plugin switches the rewritten model to configured successor prefixes when CPA returns Codex's `usage_limit_reached` error (account quota exhausted), or HTTP 429 with error code `model_cooldown` (CPA determined that all credentials for the current model are cooling down). For example, after quota exhaustion or model cooldown for `prefix_1/gpt-5.5`, it can try `prefix_2/gpt-5.5` and then `prefix_3/gpt-5.5`. By default, a generic HTTP 429 alone does not trigger fallback.
+### 2. Configure
 
-```yaml
-quota_fallback:
-  enabled: true
-  # Set to true to also fall back on other upstream errors.
-  fallback_on_other_errors: false
-  prefixes:
-    prefix_1:
-      - prefix_2
-      - prefix_3
-```
-
-The list is applied for one level only and in the specified order. By default, only `usage_limit_reached` and CPA's `model_cooldown` errors trigger a switch; a generic HTTP 429 alone does not. Set `fallback_on_other_errors` to `true` to also switch on other upstream errors, including generic HTTP 429 responses. A streaming request that has already emitted content never switches models. Every switch is recorded in the CPA main log with `quota_fallback=true`. Switching prefixes does not clear CPA's credential-wide cooldown; CPA still selects credentials for the target prefix according to its own cooldown state.
-
-### Codex quota queries
-
-The plugin implements CPA's `QuotaProvider` capability; its own provider currently supports Codex only. This requires CPA v7.3.9 or later, which includes the `QuotaProvider` ABI. It also registers public resource endpoints without the CPA Management Key: the prefix-based query and reset endpoints require a valid downstream CPA API key, while `/quota/direct` accepts a Codex access token directly.
-
-```text
-GET /v0/resource/plugins/user-routing/quota
-Authorization: Bearer <CPA downstream API key>
-```
-
-The request key selects the nominal prefix from `prefix_map`. The plugin queries Codex credentials for that prefix and the ordered successors in `quota_fallback.prefixes`. An account is considered to have quota only when every returned quota window (such as `primary` and `secondary`) has a remaining fraction greater than zero; if either window is zero, fallback continues. Querying stops at the first prefix with an available account. The response keeps only the nominal and selected actual prefix entries instead of returning the full `prefixes` list: `nominal_prefix` and `actual_prefix` identify the two prefixes, while `nominal_accounts` and `actual_accounts` are dictionaries keyed by credential email. If the nominal prefix still has quota, `actual_prefix` remains the nominal prefix and the duplicate `actual_accounts` field is omitted. Each account item includes the normalized quota fields and `reset_credits`: `available_count` is the number of available reset credits, `expires_at` lists expiry times for available credits with an expiry, `without_expiry` counts credits that do not expire, `expiry_details_available` indicates whether detailed expiry data was retrieved, and `expiry_details_complete` indicates whether the returned expiry details cover all available credits (the upstream may truncate the detail list). Credential indexes, tokens, credit IDs, and raw auth JSON are never returned. Read-only usage and reset-credit queries retry up to three times (four attempts total); reset-credit consumption is never retried.
-
-The same `/quota` endpoint also accepts an explicit CPA provider and account email:
-
-```text
-GET /v0/resource/plugins/user-routing/quota?provider=antigravity&email=account@example.com
-Authorization: Bearer <CPA downstream API key>
-```
-
-Normally, `provider` and `email` must be supplied together. If both are omitted, the original Codex prefix-based query is used. Exception: `provider=kiro` without `email` queries every available Kiro credential. An explicit lookup still requires a valid downstream CPA API key, but it is not restricted by that key's model prefix or `quota_fallback` scope: any client holding a valid downstream key can query these credentials' quotas. Issue CPA downstream API keys only to trusted clients. Provider and email comparisons are case-insensitive; multiple matching credentials in a single-account query return HTTP 409. The plugin resolves the credential's `auth_index` through CPA's plugin ABI, then uses the same `POST /v8/management/requests/api-call` route as the CPA Management Center for Antigravity and Claude: Antigravity queries `retrieveUserQuotaSummary` and supplements it with `loadCodeAssist` subscription information, while Claude queries OAuth `usage` and optionally `profile`. This works even when CPA does not implement a native `QuotaProvider` for those providers. Other providers still use CPA's native `POST /v0/management/quota/fetch` and require a CPA quota provider or credential `quota_probe`.
-
-A successful explicit-provider response uses the same email-keyed `nominal_accounts` map and per-account `subscription`, `summary`, and `groups[].buckets[]` fields as Codex, plus `partial: false`. It does not select a model prefix, so it omits `nominal_prefix`, `actual_prefix`, and `actual_accounts`. Claude's `five-hour`/`seven-day` and Antigravity's `5h`/`weekly` windows are mapped to the common `primary`/`secondary` names; `sourceWindow` retains the original window name. Both Antigravity groups, “Gemini Models” and “Claude and GPT models”, are retained, including all four five-hour and weekly `remainingFraction` values. Non-Codex providers have no Codex-specific `reset_credits` field.
-
-Query every Kiro account:
-
-```text
-GET /v0/resource/plugins/user-routing/quota?provider=kiro
-Authorization: Bearer <CPA downstream API key>
-```
-
-This endpoint calls CPA's native `quota/fetch` and reuses the installed, enabled [Kiro plugin](https://github.com/nguyenha935/kiro-cpa-plugin)'s `QuotaProvider`; this plugin does not duplicate AWS token or region logic. Each account retains its subscription and `summary` values, with one `Kiro` group containing one `monthly` bucket (`remainingFraction`, `resetTime`, and the original usage description). The account map prefers email keys, falls back to label/file name/`auth_index`, and appends `auth_index` to a repeated email. Partial failures return available accounts with `partial: true`; all failures return HTTP 502; no available Kiro credentials return an empty account map. A Kiro native quota provider (or a CPA credential `quota_probe`) must be available. Any valid downstream CPA key can see all these accounts' email addresses and quota values.
-
-This branch requires `MANAGEMENT_PASSWORD` in the CPA process environment. There is no need to recover the original key from the bcrypt hash: you can set a new strong Management Key for the service while retaining the existing config hash. CPA accepts the environment secret, and the plugin neither reads nor cracks the hash or puts the key in plugin config or client requests. If the environment variable is unset, this branch returns HTTP 503 while the original Codex query keeps working. Prefer injecting it through a systemd `EnvironmentFile` with mode `0600`.
-
-Security note: in the current CPA upstream implementation, setting `MANAGEMENT_PASSWORD` enables CPA's entire Management API and overrides `remote-management.allow-remote: false`; it is not a plugin-only or localhost-only secret. If CPA listens on a public or LAN interface, remote clients can also attempt to authenticate to Management API routes with this key. Restrict the management listener with a firewall or bind it to localhost, and protect both the systemd environment file and the service process environment. The plugin preserves the configured host name for HTTP Host/TLS verification but forces its TCP connection to loopback and disables outbound proxies and redirects, so the plugin itself cannot send the Management Key to a remote host. CPA must listen on loopback or a wildcard address; otherwise the lookup fails closed. The key is never returned to clients or written to plugin logs.
-
-You can also query one account directly using the required parts of a standard Codex auth file, without a downstream CPA API key, prefix lookup, or CPA auth-file lookup:
-
-```text
-GET /v0/resource/plugins/user-routing/quota/direct
-Authorization: Bearer <Codex tokens.access_token>
-ChatGPT-Account-ID: <Codex tokens.account_id>
-```
-
-The response contains an `accounts` dictionary keyed by the email claim in the access token (falling back to the account ID), with the same quota fields as above. The email is only a display label; the upstream validates the credential. This route returns no prefix fields. `base_url`, `id_token`, and `refresh_token` are not required; the default Codex endpoint is used. The route does not validate a CPA downstream key: anyone presenting a valid Codex access token can query its quota. Use HTTPS, never put the token in the URL, and ensure that proxies and application logs redact `Authorization`. Read-only usage and reset-credit detail queries retry up to three times.
-
-The same credentials can synchronously consume one available reset credit for that account:
-
-```text
-GET /v0/resource/plugins/user-routing/quota/direct/reset
-Authorization: Bearer <Codex tokens.access_token>
-ChatGPT-Account-ID: <Codex tokens.account_id>  # optional; otherwise read from the access-token claim
-```
-
-Reset requires only `access_token` and `account_id`; the email is used only as the response account label and can be decoded from the access token. `id_token`, `refresh_token`, `last_refresh`, and `base_url` are not required; the default Codex endpoint is used when no base URL is provided. The response contains `success` and an `accounts` result keyed by email (or account ID). No CPA API key, CPA auth-file lookup, or prefix lookup is involved. This is a mutating GET request: the read-only credit lookup may retry up to three times, but the consumption request is sent only once. Do not trigger it through browser prefetch, link previews, or automatic client retries. Consumption is sent directly to Codex and does not clear CPA's local quota cooldown. Use HTTPS and ensure `Authorization` is not logged.
-
-The plugin also implements CPA's native `QuotaProvider.ResetQuota`, which can consume one Codex reset credit for a single auth file through CPA's native Management API, protected by the Management Key:
-
-```text
-POST /v0/management/plugins/user-routing/quota/reset
-{"auth_index":"<CPA auth index>"}
-```
-
-After a successful reset, CPA also clears that auth file's local quota cooldown. This native reset endpoint requires the CPA Management Key.
-
-The plugin also provides a synchronous GET reset endpoint authenticated by the downstream API key:
-
-```text
-GET /v0/resource/plugins/user-routing/quota/reset
-Authorization: Bearer <CPA downstream API key>
-```
-
-It only processes enabled, available Codex auth files under the key's `nominal_prefix`; it does not follow `quota_fallback`. It makes at most one attempt to consume an available reset credit for each account, waits for all accounts to finish, and returns a `nominal_accounts` dictionary with per-account `success` and `message` values. The mutating consumption request is never retried; its preceding read-only quota checks follow the three-retry policy above. This is a mutating GET request, so do not trigger it through browser prefetching, link previews, or automatic client retries. Because this public resource route calls Codex directly, it bypasses CPA's native Management API post-processing and does not clear CPA's local quota cooldown; use the native management endpoint above when local cooldown clearing is required. If the connection times out before the consumption result is returned, an account may already have been reset, but the plugin will not retry; query the remaining count first.
-
-Example successful response:
-
-```json
-{"nominal_prefix":"prefix1/","success":true,"partial":false,"nominal_accounts":{"account@example.com":{"success":true,"message":"Codex quota reset credit consumed"}}}
-```
+Add this to CPA's `config.yaml`:
 
 ```yaml
-quota_provider:
-  enabled: true
-  public_endpoint: true
-  cache_ttl: "1m"
-```
-
-`cache_ttl` defaults to `1m` and caches successful quota reads by CPA credential `provider + auth_index`; changing the credential invalidates its cache key, and simultaneous reads of one credential are coalesced. The normal Codex `/quota` caches usage and reset-credit details together, while native `quota.fetch` also caches usage; explicit Claude/Antigravity `provider+email` and all-account Kiro queries cache successful quotas per credential. Auth-list lookup and downstream-key validation still run on every request. Errors and incomplete Codex reset-credit details are not cached. A Codex reset invalidates the relevant credential before the consumption request; `/quota/direct/reset` clears all Codex credential entries because it has no CPA `auth_index`. `/quota/direct` always queries live and bypasses this cache. Set `0s` to disable caching. Quota values and cross-prefix selection can lag by up to one TTL. This cache is independent of the model-catalog `model_cache_ttl`.
-
-With `public_endpoint: false`, CPA's native `QuotaProvider` integration remains available, but the public query and reset resource routes are not registered. Codex usage and reset-credit details are read from ChatGPT/Codex's `/backend-api/wham/usage` and `/backend-api/wham/rate-limit-reset-credits` endpoints; consumption calls the corresponding `/consume` endpoint. These upstream formats may change. See the [Codex upstream client implementation](https://github.com/openai/codex/blob/main/codex-rs/backend-client/src/client/rate_limit_resets.rs).
-
-If an exhausted Codex window resets before the cache TTL, the cached result expires at that reset time. The regular `/quota` endpoint rechecks the nominal account once CPA's `next_retry_after` has elapsed, even if CPA still reports `unavailable`. Unavailable accounts without a retry time are still skipped.
-
-Supported APIs/protocols:
-
-- OpenAI Chat Completions (`openai`)
-- OpenAI Responses (`openai-response`)
-- Claude Messages (`claude`)
-- Gemini (`gemini`)
-- OpenAI Videos: `POST /v1/videos`, `/v1/videos/generations`, `/v1/videos/edits`, `/v1/videos/extensions`, and `/openai/v1/videos` (`openai-video`)
-- Codex Alpha Search: `POST /v1/alpha/search` and `/backend-api/codex/alpha/search` (`codex-alpha-search`, requires CLIProxyAPI v7.2.95 or later)
-
-Video requests use the same API-key prefix map, model-catalog validation, logging, and quota-fallback behavior as message requests. Alpha Search resolves the prefix during model routing and asks CPA to select the Codex account with the final model; the request body sent to Codex keeps the unprefixed model. Alpha Search does not pass through the plugin executor, so `quota_fallback` is unavailable for this endpoint. Claude's `/v1/messages/count_tokens` does not pass through the plugin because the current CLIProxyAPI plugin ABI has no callback for performing token counting through the host. That endpoint retains CPA's native behavior.
-
-Image endpoints still cannot be routed safely by this plugin. The plugin-executor callback for image endpoints does not carry an "allow image model" flag, so CPA rejects image-only models such as `gpt-image-*` and `grok-imagine-image*`. This capability requires a corresponding CPA core callback.
-
-## Build
-
-Go 1.26 or later and a C compiler for the target platform are required because CLIProxyAPI plugins use the `c-shared` ABI. On Windows, LLVM-MinGW's `x86_64-w64-mingw32-clang` is recommended; some newer MinGW GCC versions produce `PE BigObj` intermediate files that the current Go cgo parser does not support.
-
-Windows:
-
-```powershell
-$env:CC = "x86_64-w64-mingw32-clang" # when LLVM-MinGW is on PATH
-.\scripts\build.ps1
-```
-
-Linux:
-
-```bash
-./scripts/build.sh
-```
-
-To cross-compile a Linux `amd64` build on Windows, install Zig and run:
-
-```powershell
-.\scripts\build.ps1 -Target linux
-```
-
-Build artifacts are placed in `dist/`:
-
-- Windows: `user-routing.dll`
-- Linux: `user-routing.so`
-- macOS: `user-routing.dylib`
-
-Copy the dynamic library to CPA's `plugins.dir` directory. The plugin ID is determined by the filename and must remain `user-routing`.
-
-### GitHub Release builds
-
-Pushing a Git tag that matches `v*` automatically triggers GitHub Actions. The workflow runs tests first, then builds shared libraries for Windows, Linux, and macOS on `amd64` and `arm64`.
-
-Each target is published as a separate ZIP asset containing only its corresponding `user-routing` shared library. The release also includes a `.sha256` file for every ZIP and an aggregated `checksums.txt`. For example, to publish a new version:
-
-```bash
-git tag v0.2.3
-git push main v0.2.3
-```
-
-## Configuration
-
-See [config.example.yaml](./config.example.yaml) for a complete example. The minimum configuration is:
-
-```yaml
+# API keys used by clients. In CPA v8 these live under access.api-keys; older versions use top-level api-keys.
 api-keys:
-  - "apikey_1"
-  - "apikey_2"
+  - "key-of-user-a"
+  - "key-of-user-b"
 
 plugins:
   enabled: true
@@ -210,57 +55,368 @@ plugins:
     user-routing:
       enabled: true
       prefix_map:
-        apikey_1: "prefix_1/"
-        apikey_2: "prefix_2/"
-        default: ""
+        key-of-user-a: "team-a/"
+        key-of-user-b: "team-b/"
+        default: ""          # prefix used in all other cases; empty means no prefix
 ```
 
-You can also use the JSON string from the original requirement directly:
+- The trailing `/` is optional: `team-a` and `team-a/` are the same.
+- Every key in `prefix_map` must already be in CPA's API key list, or the plugin refuses to load the configuration (so a typo cannot silently disable a rule). To configure keys before adding them to CPA, set `strict_key_validation: false`.
+- `prefix_map` can also be a one-line JSON string: `prefix_map: '{"key-of-user-a":"team-a/","default":""}'`.
+
+See [config.example.yaml](./config.example.yaml) for a complete example.
+
+### 3. Verify
+
+Restart CPA and send a request. The CPA log should contain:
+
+```text
+msg="user-routing selected execution model" requested_model=gpt-5 model=team-a/gpt-5 used_default=false
+```
+
+- `requested_model`: the model the client asked for.
+- `model`: the model actually used.
+- `used_default`: whether `default` was used because the key has no mapping or the model does not exist under its prefix.
+- After a quota switch, the line also includes `quota_fallback=true`.
+
+The plugin never writes API keys to the log.
+
+> CPA's raw HTTP request dump is recorded before the plugin runs, so it still shows the client's original model name. To see which model was actually used, rely on the line above, CPA's credential-selection log, and usage records.
+
+## How it works
+
+For each request, the plugin:
+
+1. Reads the API key from the request header or query string and checks that it is in CPA's API key list. Unknown or missing keys always get `default`.
+2. Looks up the key's prefix and queries CPA's own `/v1/models` to confirm that `prefix + model` (for example `team-a/gpt-5`) really exists.
+3. Uses it if it exists; otherwise falls back to the `default` prefix.
+4. Rewrites the top-level `model` field of the JSON body and hands the request back to CPA. Account selection and usage accounting then use the rewritten model.
+
+The model list is cached separately for each key, for 5 seconds by default (`model_cache_ttl`). When CPA's config file changes, the plugin rereads its API key list automatically; the plugin's own settings are updated through CPA's plugin reload mechanism.
+
+## Supported APIs
+
+| API | Notes |
+| --- | --- |
+| OpenAI Chat Completions | Fully supported |
+| OpenAI Responses | Fully supported |
+| Claude Messages | Fully supported |
+| Gemini | Fully supported |
+| OpenAI Videos: `POST /v1/videos`, `/v1/videos/generations`, `/v1/videos/edits`, `/v1/videos/extensions`, `/openai/v1/videos` | Fully supported, including quota group switching |
+| OpenAI Images: `POST /v1/images/generations`, `/v1/images/edits` (JSON and multipart) | Fully supported, including quota group switching; requires CPA v8.0.5+. Older CPA versions reject image requests forwarded by plugins |
+| Codex Alpha Search: `POST /v1/alpha/search`, `/backend-api/codex/alpha/search` | Prefix routing supported, quota group switching **not** supported; requires CPA v7.2.95+. The body sent to Codex keeps the unprefixed model; the prefix is only used to let CPA pick the account |
+
+Not handled by this plugin:
+
+- **Claude `/v1/messages/count_tokens`**: CPA's plugin interface cannot yet let a plugin perform token counting through the host, so CPA's native behavior is kept.
+
+## Optional features
+
+### Hide prefixed models
+
+With prefixes in use, clients see many entries like `team-a/gpt-5` and `team-b/gpt-5` in their model list. These settings tidy it up:
 
 ```yaml
-prefix_map: '{"apikey_1":"prefix_1/","apikey_2":"prefix_2/","default":""}'
+register_deduplicated_models: true   # also register unprefixed, deduplicated names such as gpt-5 (requires CPA v7.2.155+)
+hide_prefixed_models: true           # hide the prefixed entries from model lists (requires the option above)
+include_default_prefix: true         # also strip a non-empty default prefix; on by default
 ```
 
-Non-empty prefixes are normalized to end with `/`, so `prefix_1` and `prefix_1/` are equivalent.
+Notes:
 
-### Configuration fields
+- A prefixed entry is hidden only when its unprefixed counterpart appears in the same list, so the list never ends up empty.
+- This affects **only the list**. The models stay registered in CPA, and clients can still request `team-a/gpt-5` directly.
+- Both regular and Claude-format model lists are handled (including `first_id` and `last_id` in Claude-format responses).
+- `hide_prefixed_models` requires a CPA version that supports `response_interceptor` plugins.
+
+### Switch groups when quota runs out
+
+For Codex. When one group of accounts runs out of quota, the plugin retries with the next group's prefix, and the client does not notice.
+
+```yaml
+quota_fallback:
+  enabled: true
+  fallback_on_other_errors: false
+  prefixes:
+    team-a:          # when team-a runs out...
+      - team-b       # ...try team-b first
+      - team-c       # ...then team-c
+```
+
+**When does it switch?**
+
+| Upstream response | Default | `fallback_on_other_errors: true` |
+| --- | --- | --- |
+| Codex `usage_limit_reached` (account quota exhausted) | Switch | Switch |
+| HTTP 429 from CPA with error code `model_cooldown` (every account for the model is cooling down) | Switch | Switch |
+| Plain HTTP 429 and other upstream errors | No switch | Switch |
+
+Keep in mind:
+
+- Only the listed prefixes are tried, in order, one level deep. It does not continue into `team-b`'s own fallback list.
+- A streaming request never switches once content has been sent to the client.
+- Switching prefixes does not clear CPA's account cooldown; CPA still picks accounts in the target group according to its own cooldown state.
+
+#### Auto-sort
+
+The `prefixes` map above is a fixed order per prefix. With auto-sort, the plugin periodically queries the Codex quota of a set of prefixes and uses the result to decide whom to borrow from when the nominal prefix is unavailable.
+
+```yaml
+quota_fallback:
+  enabled: true                  # required for auto-sort to take effect
+  auto_sort:
+    enabled: true
+    strategy: borrow             # borrow (default) or weekly_urgency
+    five_hour_reserve: 25%       # 5-hour reserve; 25%, 25 or 0.25; default 25%
+    refresh_interval: "5m"       # quota refresh interval; default 5 minutes, minimum 30 seconds
+    prefixes: [team-a, team-b, team-c]
+```
+
+- **Scope**: only requests whose nominal prefix is listed in `auto_sort.prefixes` use auto-sort, and they only borrow from other prefixes in that list. Requests whose nominal prefix is not listed keep using their own list in `quota_fallback.prefixes`.
+- **The nominal prefix is always tried first.** The sorted order is used only after it reports exhausted quota or model cooldown.
+- **Immediate demotion**: when a prefix returns exhausted quota or model cooldown on a real request, it moves to the back right away instead of waiting for the next refresh.
+- **Stale data**: if a cached window's reset time has passed, the window is treated as reset (full).
+- **`/quota` agrees**: the `actual_prefix` returned by `GET /quota` uses the same order.
+- Each refresh writes the resulting order to the CPA log at debug level (`user-routing auto-sort refreshed`). `auto_sort=true` in a request log line means that request used auto-sort.
+
+**`borrow` strategy (default): borrow without hurting the account owner.** Meant for "everyone has their own accounts and uses them independently, but can borrow someone else's when they run short".
+
+The plugin first estimates each account's **spare weekly quota**: projecting the owner's pace so far this week, how much will they still use before the weekly reset? Whatever is left over is quota they will not need.
+
+```text
+still needed = used this week ÷ time elapsed this week × time until weekly reset
+spare weekly = weekly remaining − still needed
+```
+
+During the first day of a weekly window there is too little history, so the plugin conservatively assumes the owner will use all of the remaining quota. The weekly window is treated as 7 days.
+
+Prefixes are then ordered as follows:
+
+| Order | Group | Condition | Order within group |
+| --- | --- | --- | --- |
+| 1 | Safe to borrow | Some account has spare weekly > 0 and 5-hour remaining ≥ the reserve | Earliest 5-hour reset first (if it gets drained, the owner is affected for the shortest time); then more spare weekly first |
+| 2 | Usable but affects the owner | Has a usable account but fails the condition above | More spare weekly first, then higher 5-hour remaining |
+| 3 | No data | Not refreshed yet, or the query failed | Configured order |
+| 4 | Exhausted | No usable account | Earliest recovery first |
+| 5 | No accounts | No enabled Codex account under the prefix | Configured order |
+
+**`weekly_urgency` strategy: spend weekly quota that is about to expire first.** Meant for treating all accounts as one shared pool. Usable prefixes are ordered by `weekly remaining ÷ hours until weekly reset`, highest first (summed over accounts in the prefix), followed by no-data, exhausted, and no-account prefixes. This strategy ignores `five_hour_reserve`.
+
+### Quota query and reset endpoints
+
+The plugin implements CPA's `QuotaProvider` (requires CPA v7.3.9+) and adds HTTP endpoints so that users with an ordinary API key can check quota without the CPA management key.
+
+**Overview** (all paths start with `/v0/resource/plugins/user-routing`, omitted below):
+
+| Endpoint | Purpose | Authentication | Side effects |
+| --- | --- | --- | --- |
+| `GET /quota` | Codex quota of the accounts behind your own key | CPA API key | No |
+| `GET /quota?provider=...&email=...` | Quota of any specific account (Claude, Antigravity, etc.) | CPA API key + server-side `MANAGEMENT_PASSWORD` | No |
+| `GET /quota?provider=kiro` | Quota of all Kiro accounts | CPA API key + server-side `MANAGEMENT_PASSWORD` | No |
+| `GET /quota/direct` | Query a single Codex account with its login token | Codex access token | No |
+| `GET /quota/reset` | Spend one reset credit on each Codex account behind your key | CPA API key | **Yes** |
+| `GET /quota/direct/reset` | Spend one reset credit on a single account using its login token | Codex access token | **Yes** |
+| `POST /v0/management/plugins/user-routing/quota/reset` | CPA management API: spend one reset credit on a given auth file | CPA management key | **Yes** |
+
+> **The two reset GET endpoints really do spend reset credits.** Do not let browser prefetching, chat-app link previews, or auto-retrying clients hit them.
+
+#### Your own Codex quota: `GET /quota`
+
+```text
+GET /v0/resource/plugins/user-routing/quota
+Authorization: Bearer <CPA API key>
+```
+
+The plugin finds the key's prefix (the "nominal prefix") and checks whether that group's Codex accounts still have quota. If not, it checks the next groups in `quota_fallback.prefixes` order (or the [auto-sort](#auto-sort) order when enabled) and stops at the first group with quota (the "actual prefix").
+
+An account counts as "having quota" only if every quota window (for example the 5-hour `primary` and weekly `secondary` windows) is above zero. If any window is at zero, the search continues.
+
+Main response fields:
+
+| Field | Meaning |
+| --- | --- |
+| `nominal_prefix` | The prefix this key is mapped to |
+| `actual_prefix` | The prefix that would actually be used; equal to the nominal prefix while it still has quota |
+| `nominal_accounts` | Accounts under the nominal prefix, keyed by email |
+| `actual_accounts` | Accounts under the actual prefix; omitted when it equals the nominal prefix |
+
+Each account has the standard quota fields plus `reset_credits` (remaining reset credits):
+
+| Field | Meaning |
+| --- | --- |
+| `available_count` | Number of reset credits left |
+| `expires_at` | Expiry times of the credits that expire |
+| `without_expiry` | Number of credits that never expire |
+| `expiry_details_available` | Whether expiry details were retrieved |
+| `expiry_details_complete` | Whether the details cover every credit (the upstream may truncate them) |
+
+Responses never include tokens, auth-file indexes, credit IDs, or raw auth JSON. Failed queries are retried up to 3 times.
+
+#### A specific account: `GET /quota?provider=...&email=...`
+
+```text
+GET /v0/resource/plugins/user-routing/quota?provider=antigravity&email=account@example.com
+Authorization: Bearer <CPA API key>
+```
+
+- Pass `provider` and `email` together; both are case-insensitive. Without them you get "your own Codex quota" above.
+- Returns 409 if more than one auth file matches.
+- Exception: `provider=kiro` without `email` returns **all** Kiro accounts.
+- Claude and Antigravity are queried through their official quota APIs (the same way the CPA management panel does it), so this works even though CPA has no built-in quota support for them. Other providers go through CPA's native `quota/fetch` and need support from CPA or the relevant plugin.
+- The response format matches Codex (`nominal_accounts`, `subscription`, `summary`, `groups[].buckets[]`) plus `partial: false`, but has no prefix fields and no `reset_credits`.
+- Window names are unified: Claude's `five-hour`/`seven-day` and Antigravity's `5h`/`weekly` become `primary`/`secondary`, with the original name kept in `sourceWindow`. Both Antigravity groups, "Gemini Models" and "Claude and GPT models", are kept in full.
+
+**All Kiro accounts** (`provider=kiro`): requires the [Kiro plugin](https://github.com/nguyenha935/kiro-cpa-plugin) to be installed and enabled. Each account gets one `Kiro` group with one `monthly` bucket. Accounts are keyed by email, falling back to label, file name, or `auth_index`; repeated emails get `auth_index` appended. If some accounts fail, the rest are returned with `partial: true`; if all fail, the response is 502; with no Kiro accounts, the dictionary is empty.
+
+> **Permissions:** these lookups ignore the key's prefix, so **any** valid CPA API key can see these accounts' email addresses and quota. Only give API keys to people you trust.
+
+**The server needs `MANAGEMENT_PASSWORD`.** These lookups go through CPA's management API, so `MANAGEMENT_PASSWORD` must be set in the CPA process environment. Otherwise they return 503 (the normal `/quota` query keeps working).
+
+- You do not need to recover the original password behind the bcrypt hash in the config. Just generate a new strong random value; the existing config can stay as it is.
+- Injecting it through a systemd `EnvironmentFile` with mode `0600` is recommended.
+- The plugin never reads or cracks the config hash, and never puts this key in plugin config, client requests, responses, or logs.
+
+> **Security warning:** in current CPA, setting `MANAGEMENT_PASSWORD` turns on CPA's **entire** management API and overrides `remote-management.allow-remote: false`. If CPA listens on a public or LAN address, others can try this key against the management API too. Restrict access with a firewall or listen on localhost only, and protect the environment file.
+>
+> The plugin itself only connects to CPA over loopback, without proxies or redirects, so the plugin never sends the key to another machine. In turn, CPA must listen on a loopback address or a wildcard address such as `0.0.0.0`; otherwise the lookup fails.
+
+#### Query a Codex account directly: `GET /quota/direct`
+
+```text
+GET /v0/resource/plugins/user-routing/quota/direct
+Authorization: Bearer <tokens.access_token from a Codex auth file>
+ChatGPT-Account-ID: <tokens.account_id from a Codex auth file>
+```
+
+- No CPA API key, prefixes, or CPA auth files are involved. Anyone with a valid Codex access token can query it.
+- Returns an `accounts` dictionary keyed by the email in the token (or the account ID if no email is found), with the same quota fields as above.
+- `id_token`, `refresh_token`, and `base_url` are not needed; the default Codex endpoint is always used.
+- Always queried live, never cached.
+- Use HTTPS, never put the token in the URL, and make sure proxies and application logs do not record the `Authorization` header.
+
+#### Spending reset credits
+
+There are three ways:
+
+| Method | Scope | Clears CPA's local cooldown |
+| --- | --- | --- |
+| `GET /quota/reset` (CPA API key) | Every enabled Codex account under the key's nominal prefix (including accounts CPA is cooling down), at most once each; does **not** follow `quota_fallback` | No |
+| `GET /quota/direct/reset` (Codex token) | One account, once | No |
+| `POST /v0/management/plugins/user-routing/quota/reset` (CPA management key) | One given auth file, once | **Yes** |
+
+```text
+GET /v0/resource/plugins/user-routing/quota/reset
+Authorization: Bearer <CPA API key>
+```
+
+Example success:
+
+```json
+{"nominal_prefix":"team-a/","success":true,"partial":false,"nominal_accounts":{"account@example.com":{"success":true,"message":"Codex quota reset credit consumed"}}}
+```
+
+```text
+GET /v0/resource/plugins/user-routing/quota/direct/reset
+Authorization: Bearer <Codex tokens.access_token>
+ChatGPT-Account-ID: <Codex tokens.account_id>   # optional; read from the token if omitted
+```
+
+Returns `success` and an `accounts` dictionary keyed by email (or account ID).
+
+```text
+POST /v0/management/plugins/user-routing/quota/reset
+{"auth_index":"<CPA auth index>"}
+```
+
+This is CPA's native management API and needs the CPA management key. On success, CPA also clears that account's local cooldown.
+
+For all three:
+
+- The spend request is **sent once and never retried automatically** (the read-only checks before it may retry).
+- If the connection times out before the result arrives, the reset may already have happened. Check the remaining count before trying again.
+- The two GET endpoints call Codex directly, so CPA does not know a reset happened and does not clear its local cooldown. Use the management endpoint when you need that.
+
+#### Quota cache
+
+```yaml
+quota_provider:
+  enabled: true          # register the QuotaProvider
+  public_endpoint: true  # expose the /v0/resource/... endpoints above; false keeps only CPA's native management API
+  cache_ttl: "1m"        # how long successful quota queries are cached; 0s disables
+```
+
+- Successful results are cached per account (`provider + auth_index`); concurrent queries for the same account are merged into one. The cache entry is invalidated when the account's credentials change.
+- Failed queries and incomplete reset-credit details are not cached.
+- A cached entry expires early when one of its quota windows reaches its reset time.
+- Before a Codex reset, the account's cache entry is cleared; `/quota/direct/reset` clears all Codex entries because it cannot tell which CPA account it is.
+- `/quota/direct` never uses the cache.
+- With caching on, quota numbers and the "actual prefix" choice can lag by up to one `cache_ttl`.
+- If CPA marks a nominal-prefix account as unavailable but its `next_retry_after` has passed, `/quota` checks it again; unavailable accounts without a retry time are still skipped.
+
+Codex quota data comes from ChatGPT's internal endpoints `/backend-api/wham/usage`, `/backend-api/wham/rate-limit-reset-credits`, and its `/consume` endpoint; see the [official Codex client implementation](https://github.com/openai/codex/blob/main/codex-rs/backend-client/src/client/rate_limit_resets.rs). These are not public APIs and may change at any time.
+
+## Configuration reference
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `enabled` | `true` | Whether to enable the plugin. |
-| `cpa_config_path` | Auto-discovered | CPA's `-config` argument is used first, then `CPA_CONFIG_PATH`, then `./config.yaml`. |
-| `prefix_map` | `{"default":""}` | Mapping from native API keys to prefixes; `default` is the fallback prefix. |
-| `register_deduplicated_models` | `false` | Register additional unprefixed, deduplicated models in CPA. |
-| `hide_prefixed_models` | `false` | Hide configured prefixed models from catalog responses; requires `register_deduplicated_models` and does not disable routing. |
-| `include_default_prefix` | `true` | Include a non-empty `default` prefix in the deduplication prefix list. |
-| `quota_fallback.enabled` | `false` | Enable cross-prefix model fallback when a Codex account returns `usage_limit_reached` or CPA returns `model_cooldown`. |
-| `quota_fallback.fallback_on_other_errors` | `false` | Also perform cross-prefix fallback for other upstream errors; streaming requests only fall back before their first emitted payload. |
-| `quota_fallback.prefixes` | Empty | Mapping from source prefixes to target prefixes to attempt in order. |
-| `quota_provider.enabled` | `true` | Register the Codex `QuotaProvider`. |
-| `quota_provider.public_endpoint` | `true` | Register public quota resource routes. Normal queries require a downstream API key; `provider+email` queries also need `MANAGEMENT_PASSWORD` in CPA's process environment (which also enables CPA's entire Management API); `/quota/direct` accepts a Codex access token. |
-| `quota_provider.cache_ttl` | `1m` | Cache successful Codex, Claude, and Antigravity quota reads by CPA `auth_index`; `0s` disables it, and `/quota/direct` remains uncached. |
-| `strict_key_validation` | `true` | Reject configuration when a mapped key does not exist in CPA's `api-keys`. |
-| `models_url` | Auto-derived | Absolute URL of CPA's `/v1/models` endpoint. |
-| `model_cache_ttl` | `5s` | Model catalog cache lifetime; `0s` disables caching. |
-| `model_lookup_timeout` | `3s` | Timeout for local model-catalog lookups. |
-| `models_tls_insecure_skip_verify` | `false` | Enable only when local CPA HTTPS uses an untrusted certificate. |
-| `log_routing` | `true` | Record the final model in CPA's main log. |
+| `enabled` | `true` | Enable the plugin |
+| `prefix_map` | `{"default":""}` | Mapping from API keys to prefixes; `default` is the fallback |
+| `strict_key_validation` | `true` | Refuse to load if `prefix_map` contains a key CPA does not know |
+| `cpa_config_path` | Auto | Path to CPA's config file. Tries CPA's `-config` argument, then the `CPA_CONFIG_PATH` environment variable, then `./config.yaml` |
+| `register_deduplicated_models` | `false` | Also register model names with the prefix removed |
+| `hide_prefixed_models` | `false` | Hide prefixed entries from model lists; requires the option above |
+| `include_default_prefix` | `true` | Also strip a non-empty `default` prefix |
+| `quota_fallback.enabled` | `false` | Switch groups when quota runs out |
+| `quota_fallback.fallback_on_other_errors` | `false` | Also switch on other upstream errors |
+| `quota_fallback.prefixes` | Empty | For each prefix, the prefixes to try in order when it runs out |
+| `quota_fallback.auto_sort.enabled` | `false` | Enable auto-sort |
+| `quota_fallback.auto_sort.strategy` | `borrow` | Sort strategy: `borrow` (protect the owner) or `weekly_urgency` (spend expiring weekly quota first) |
+| `quota_fallback.auto_sort.five_hour_reserve` | `25%` | 5-hour reserve for the `borrow` strategy |
+| `quota_fallback.auto_sort.refresh_interval` | `5m` | Quota refresh interval; minimum `30s` |
+| `quota_fallback.auto_sort.prefixes` | Empty | Prefixes that take part in auto-sort; at least 2 when enabled |
+| `quota_provider.enabled` | `true` | Register the Codex quota provider |
+| `quota_provider.public_endpoint` | `true` | Expose the `/v0/resource/plugins/user-routing/quota...` endpoints |
+| `quota_provider.cache_ttl` | `1m` | Quota cache lifetime; `0s` disables |
+| `models_url` | Auto | Full URL of CPA's `/v1/models`, normally derived from CPA's host, port, and TLS settings |
+| `model_cache_ttl` | `5s` | Model list cache lifetime; `0s` disables |
+| `model_lookup_timeout` | `3s` | Timeout for model list lookups |
+| `models_tls_insecure_skip_verify` | `false` | Enable only if CPA's local HTTPS uses a self-signed certificate |
+| `log_routing` | `true` | Log the final model in CPA's log |
 
-When `strict_key_validation` is enabled, the plugin verifies that every API key in `prefix_map` exists in CPA's downstream client-key list. Legacy configurations use the root `api-keys`; CPA v8 configurations use `access.api-keys`. The root `api-keys` provider map in v8 is not treated as a client-key list. A missing mapped key rejects configuration load/reload, preventing a typo from silently disabling a routing rule. When disabled, keys may be configured before they are added to CPA's client-key list; however, a request uses a mapped prefix only when it carries a CPA-authenticated API key, and unmatched requests always use the `default` prefix.
+About the API key list: older CPA versions use top-level `api-keys`. CPA v8 uses `access.api-keys`; v8's top-level `api-keys` holds upstream provider keys and is not treated as client keys.
 
-If the CPA configuration file changes at runtime, the plugin rereads the client API key list based on the file modification time. The plugin's own `prefix_map` is updated through CPA's plugin reconfiguration mechanism.
+## Known issues
 
-## Logging
+- Claude token counting does not go through this plugin, and image endpoints require CPA v8.0.5+; see [Supported APIs](#supported-apis).
 
-By default, the plugin produces a log entry similar to:
+## Building from source
 
-```text
-msg="user-routing selected execution model" requested_model=gpt-5 model=prefix_1/gpt-5 used_default=false
+Requires Go 1.26+ and a C compiler for the target platform (the plugin uses cgo's `c-shared` mode).
+
+```bash
+# Linux
+./scripts/build.sh
 ```
 
-This entry is written through CPA's plugin logging callback and includes CPA's request ID. CPA then performs model execution, upstream credential selection, and usage accounting using `prefix_1/gpt-5`.
+```powershell
+# Windows (LLVM-MinGW recommended; some newer MinGW GCC versions emit PE BigObj files that Go cannot handle)
+$env:CC = "x86_64-w64-mingw32-clang"
+.\scripts\build.ps1
 
-CPA's detailed raw HTTP request dump is captured by middleware before the plugin runs, so it retains the original client request body. Use this plugin's log, CPA's credential-selection log, and usage records as the source of truth for the final execution model.
+# Cross-compile Linux amd64 on Windows (requires Zig)
+.\scripts\build.ps1 -Target linux
+```
+
+Output goes to `dist/`. Release builds inject the version with `-ldflags "-X main.pluginVersion=<version>"`.
+
+### Releasing
+
+Pushing a `v*` tag triggers GitHub Actions: tests run first, then builds for Windows, Linux, and macOS on `amd64` and `arm64`. Each platform is packaged as its own ZIP, with a `.sha256` file per ZIP and a combined `checksums.txt`.
+
+```bash
+git tag v0.2.3
+git push main v0.2.3
+```
 
 ## References
 

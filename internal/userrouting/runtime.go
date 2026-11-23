@@ -1,7 +1,6 @@
 package userrouting
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +19,7 @@ import (
 const (
 	PluginIdentifier             = "user-routing"
 	codexAlphaSearchSourceFormat = "codex-alpha-search"
+	openAIImageSourceFormat      = "openai-image"
 )
 
 var supportedFormats = map[string]struct{}{
@@ -28,6 +28,7 @@ var supportedFormats = map[string]struct{}{
 	"claude":                     {},
 	"gemini":                     {},
 	"openai-video":               {},
+	openAIImageSourceFormat:      {},
 	codexAlphaSearchSourceFormat: {},
 }
 
@@ -40,6 +41,7 @@ type Runtime struct {
 	config                   runtimeConfig
 	catalog                  *modelCatalog
 	quotaCache               quotaReadCache
+	autoSort                 *autoSorter
 	deduplicatedModelsLoaded atomic.Bool
 }
 
@@ -55,11 +57,15 @@ func NewRuntime(host HostCaller, rawConfig []byte, opts ConfigureOptions) (*Runt
 	if err != nil {
 		return nil, err
 	}
-	return &Runtime{
+	runtime := &Runtime{
 		host:    host,
 		config:  cfg,
 		catalog: catalog,
-	}, nil
+	}
+	if cfg.AutoSort.Enabled {
+		runtime.autoSort = newAutoSorter(cfg.AutoSort)
+	}
+	return runtime, nil
 }
 
 func (r *Runtime) Route(req pluginapi.ModelRouteRequest, hostCallbackID string) (pluginapi.ModelRouteResponse, error) {
@@ -196,6 +202,8 @@ func isCountTokensRequest(metadata map[string]any) bool {
 
 type hostModelExecutionRequest struct {
 	pluginapi.HostModelExecutionRequest
+	// Path mirrors the host field added in CPA v8.0.5; the pinned SDK predates it.
+	Path           string `json:"path,omitempty"`
 	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
@@ -212,10 +220,23 @@ func (r *Runtime) Execute(ctx context.Context, req pluginapi.ExecutorRequest, ho
 		return pluginapi.ExecutorResponse{}, err
 	}
 	targets := r.quotaFallbackTargets(decision.FinalModel)
+	var firstErr error
 	for index, model := range targets {
 		response, errExecute := r.executeModel(ctx, req, hostCallbackID, decision, model, index > 0)
 		if errExecute == nil {
 			return response, nil
+		}
+		r.noteQuotaFailure(model, errExecute)
+		if index > 0 && isModelNotFound(errExecute) {
+			// A fallback prefix without this model is skipped; the client
+			// should still see the error that started the fallback.
+			if index+1 < len(targets) {
+				continue
+			}
+			return pluginapi.ExecutorResponse{}, firstErr
+		}
+		if firstErr == nil {
+			firstErr = errExecute
 		}
 		if index+1 < len(targets) && r.shouldRetryQuotaFallback(errExecute) {
 			continue
@@ -231,10 +252,21 @@ func (r *Runtime) RunStream(ctx context.Context, req pluginapi.ExecutorRequest, 
 		return err
 	}
 	targets := r.quotaFallbackTargets(decision.FinalModel)
+	var firstErr error
 	for index, model := range targets {
-		retryFallback, errStream := r.streamModel(ctx, req, hostCallbackID, pluginStreamID, decision, model, index > 0)
+		retryFallback, emitted, errStream := r.streamModel(ctx, req, hostCallbackID, pluginStreamID, decision, model, index > 0)
 		if errStream == nil {
 			return nil
+		}
+		r.noteQuotaFailure(model, errStream)
+		if index > 0 && !emitted && isModelNotFound(errStream) {
+			if index+1 < len(targets) {
+				continue
+			}
+			return firstErr
+		}
+		if firstErr == nil {
+			firstErr = errStream
 		}
 		if retryFallback && index+1 < len(targets) {
 			continue
@@ -261,6 +293,7 @@ func (r *Runtime) executeModel(ctx context.Context, req pluginapi.ExecutorReques
 			Query:         req.Query,
 			Alt:           req.Alt,
 		},
+		Path:           hostRequestPath(req),
 		HostCallbackID: hostCallbackID,
 	})
 	if err != nil {
@@ -277,10 +310,10 @@ func (r *Runtime) executeModel(ctx context.Context, req pluginapi.ExecutorReques
 }
 
 // streamModel may retry only before it forwards a payload to the downstream client.
-func (r *Runtime) streamModel(ctx context.Context, req pluginapi.ExecutorRequest, hostCallbackID, pluginStreamID string, decision Decision, model string, quotaFallback bool) (bool, error) {
+func (r *Runtime) streamModel(ctx context.Context, req pluginapi.ExecutorRequest, hostCallbackID, pluginStreamID string, decision Decision, model string, quotaFallback bool) (retry bool, emitted bool, err error) {
 	body, err := rewrittenRequestBody(req, model)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	r.logDecision(hostCallbackID, req.SourceFormat, decision, model, quotaFallback)
 	raw, err := r.host.Call(pluginabi.MethodHostModelExecuteStream, hostModelExecutionRequest{
@@ -294,47 +327,47 @@ func (r *Runtime) streamModel(ctx context.Context, req pluginapi.ExecutorRequest
 			Query:         req.Query,
 			Alt:           req.Alt,
 		},
+		Path:           hostRequestPath(req),
 		HostCallbackID: hostCallbackID,
 	})
 	if err != nil {
-		return r.shouldRetryQuotaFallback(err), err
+		return r.shouldRetryQuotaFallback(err), false, err
 	}
 	var response pluginapi.HostModelStreamResponse
 	if err := json.Unmarshal(raw, &response); err != nil {
-		return false, fmt.Errorf("decode host model stream response: %w", err)
+		return false, false, fmt.Errorf("decode host model stream response: %w", err)
 	}
 	if strings.TrimSpace(response.StreamID) == "" {
-		return false, errors.New("host model stream returned an empty stream_id")
+		return false, false, errors.New("host model stream returned an empty stream_id")
 	}
 	defer func() {
 		_, _ = r.host.Call(pluginabi.MethodHostModelStreamClose, pluginapi.HostModelStreamCloseRequest{StreamID: response.StreamID})
 	}()
 
-	emitted := false
 	for {
 		chunkRaw, err := r.host.Call(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: response.StreamID})
 		if err != nil {
-			return !emitted && r.shouldRetryQuotaFallback(err), err
+			return !emitted && r.shouldRetryQuotaFallback(err), emitted, err
 		}
 		var chunk pluginapi.HostModelStreamReadResponse
 		if err := json.Unmarshal(chunkRaw, &chunk); err != nil {
-			return false, fmt.Errorf("decode host model stream chunk: %w", err)
+			return false, emitted, fmt.Errorf("decode host model stream chunk: %w", err)
 		}
 		if chunk.Error != "" {
 			errChunk := errors.New(chunk.Error)
-			return !emitted && r.shouldRetryQuotaFallback(errChunk), errChunk
+			return !emitted && r.shouldRetryQuotaFallback(errChunk), emitted, errChunk
 		}
 		if len(chunk.Payload) > 0 {
 			if _, err := r.host.Call(pluginabi.MethodHostStreamEmit, map[string]any{
 				"stream_id": pluginStreamID,
-				"payload":   bytes.Clone(chunk.Payload),
+				"payload":   chunk.Payload,
 			}); err != nil {
-				return false, err
+				return false, emitted, err
 			}
 			emitted = true
 		}
 		if chunk.Done {
-			return false, nil
+			return false, emitted, nil
 		}
 	}
 }
@@ -343,6 +376,14 @@ func (r *Runtime) quotaFallbackTargets(primaryModel string) []string {
 	targets := []string{primaryModel}
 	if r == nil || !r.config.QuotaFallback.Enabled {
 		return targets
+	}
+	if r.autoSortActive() {
+		if memberPrefix, baseModel := r.autoSort.memberPrefixOf(primaryModel); memberPrefix != "" && baseModel != "" {
+			for _, targetPrefix := range r.autoSort.order(memberPrefix) {
+				targets = append(targets, targetPrefix+"/"+baseModel)
+			}
+			return targets
+		}
 	}
 	sourcePrefix, baseModel := r.quotaFallbackSource(primaryModel)
 	if sourcePrefix == "" || baseModel == "" {
@@ -355,6 +396,25 @@ func (r *Runtime) quotaFallbackTargets(primaryModel string) []string {
 		}
 	}
 	return targets
+}
+
+func (r *Runtime) usesAutoSort(nominalModel string) bool {
+	if !r.autoSortActive() {
+		return false
+	}
+	prefix, _ := r.autoSort.memberPrefixOf(nominalModel)
+	return prefix != ""
+}
+
+// noteQuotaFailure demotes an auto-sorted prefix as soon as a real request
+// proves that its accounts are exhausted or cooling down.
+func (r *Runtime) noteQuotaFailure(model string, err error) {
+	if !r.autoSortActive() || !(isCodexQuotaExhausted(err) || isCPAModelCooldown(err)) {
+		return
+	}
+	if prefix, _ := r.autoSort.memberPrefixOf(model); prefix != "" {
+		r.autoSort.markExhausted(prefix)
+	}
 }
 
 func (r *Runtime) quotaFallbackSource(model string) (string, string) {
@@ -391,6 +451,10 @@ func isCPAModelCooldown(err error) bool {
 		return false
 	}
 	return structuredErrorCode(err.Error()) == "model_cooldown"
+}
+
+func isModelNotFound(err error) bool {
+	return err != nil && structuredErrorCode(err.Error()) == "model_not_found"
 }
 
 func structuredErrorCode(message string) string {
@@ -432,16 +496,23 @@ func (r *Runtime) logDecision(hostCallbackID, sourceFormat string, decision Deci
 			"model":           model,
 			"used_default":    decision.UsedDefault,
 			"quota_fallback":  quotaFallback,
+			"auto_sort":       r.usesAutoSort(decision.FinalModel),
 		},
 	})
 }
 
 func rewrittenRequestBody(req pluginapi.ExecutorRequest, model string) ([]byte, error) {
 	body := req.OriginalRequest
-	if len(body) == 0 {
+	// CPA's image handlers build the executable image payload themselves; for
+	// xAI models OriginalRequest is a differently shaped Images API body.
+	if len(body) == 0 || isImageRequest(req) {
 		body = req.Payload
 	}
-	body = bytes.Clone(body)
+	if len(body) == 0 {
+		body = req.OriginalRequest
+	}
+	// sjson.SetBytes without ReplaceInPlace returns a new buffer, so the
+	// shared request body is never mutated and needs no defensive copy.
 	if len(body) == 0 || !gjson.ValidBytes(body) || !gjson.GetBytes(body, "model").Exists() {
 		return body, nil
 	}
@@ -450,6 +521,21 @@ func rewrittenRequestBody(req pluginapi.ExecutorRequest, model string) ([]byte, 
 		return nil, fmt.Errorf("rewrite request model: %w", err)
 	}
 	return rewritten, nil
+}
+
+func isImageRequest(req pluginapi.ExecutorRequest) bool {
+	return strings.EqualFold(strings.TrimSpace(req.SourceFormat), openAIImageSourceFormat) ||
+		strings.EqualFold(strings.TrimSpace(req.Format), openAIImageSourceFormat)
+}
+
+// hostRequestPath keeps /v1/images/generations and /v1/images/edits distinct
+// on the nested host execution, which otherwise could not tell them apart.
+func hostRequestPath(req pluginapi.ExecutorRequest) string {
+	if !isImageRequest(req) {
+		return ""
+	}
+	path, _ := req.Metadata["request_path"].(string)
+	return strings.TrimSpace(path)
 }
 
 func protocolOrFallback(primary, fallback string) string {

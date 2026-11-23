@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,7 +25,16 @@ type modelCatalog struct {
 
 	mu        sync.Mutex
 	snapshots map[string]modelCatalogSnapshot
+	inFlight  map[string]*modelCatalogFlight
 }
+
+type modelCatalogFlight struct {
+	done   chan struct{}
+	models map[string]struct{}
+	err    error
+}
+
+var errCatalogLookupAborted = errors.New("CPA model catalog lookup aborted")
 
 type modelCatalogSnapshot struct {
 	expiresAt time.Time
@@ -39,7 +49,8 @@ func newModelCatalog(cfg runtimeConfig) (*modelCatalog, error) {
 		return nil, fmt.Errorf("create internal catalog bypass token: %w", err)
 	}
 	transport := &http.Transport{
-		Proxy: nil,
+		Proxy:           nil,
+		IdleConnTimeout: 90 * time.Second,
 		TLSClientConfig: &tls.Config{ // #nosec G402 -- explicitly controlled for a loopback CPA endpoint.
 			InsecureSkipVerify: cfg.ModelsTLSInsecureSkipVerify,
 		},
@@ -91,20 +102,57 @@ func (c *modelCatalog) ClaudeModels(ctx context.Context, apiKey string) (map[str
 
 func (c *modelCatalog) snapshot(ctx context.Context, apiKey string) (map[string]struct{}, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if snapshot, exists := c.snapshots[apiKey]; exists && len(snapshot.models) > 0 && c.ttl > 0 && time.Now().Before(snapshot.expiresAt) {
+		c.mu.Unlock()
 		return snapshot.models, nil
 	}
+	// Concurrent misses for one key share a lookup so that cache expiry under
+	// load does not fan out into one catalog download per request.
+	if flight := c.inFlight[apiKey]; flight != nil {
+		c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-flight.done:
+			return flight.models, flight.err
+		}
+	}
+	if c.inFlight == nil {
+		c.inFlight = make(map[string]*modelCatalogFlight)
+	}
+	flight := &modelCatalogFlight{done: make(chan struct{}), err: errCatalogLookupAborted}
+	c.inFlight[apiKey] = flight
+	c.mu.Unlock()
 
-	models, err := c.fetch(ctx, apiKey, false)
-	if err != nil {
-		return nil, err
+	defer func() {
+		c.mu.Lock()
+		delete(c.inFlight, apiKey)
+		if flight.err == nil && c.ttl > 0 && len(flight.models) > 0 {
+			now := time.Now()
+			if c.snapshots == nil {
+				c.snapshots = make(map[string]modelCatalogSnapshot)
+			}
+			for key, snapshot := range c.snapshots {
+				if !now.Before(snapshot.expiresAt) {
+					delete(c.snapshots, key)
+				}
+			}
+			c.snapshots[apiKey] = modelCatalogSnapshot{expiresAt: now.Add(c.ttl), models: flight.models}
+		}
+		close(flight.done)
+		c.mu.Unlock()
+	}()
+	// The lookup runs unlocked so one slow or timed-out CPA response cannot
+	// serialize every routed request behind it.
+	flight.models, flight.err = c.fetch(ctx, apiKey, false)
+	return flight.models, flight.err
+}
+
+// close releases idle keep-alive connections held by a replaced runtime.
+func (c *modelCatalog) close() {
+	if c != nil && c.client != nil {
+		c.client.CloseIdleConnections()
 	}
-	if c.snapshots == nil {
-		c.snapshots = make(map[string]modelCatalogSnapshot)
-	}
-	c.snapshots[apiKey] = modelCatalogSnapshot{expiresAt: time.Now().Add(c.ttl), models: models}
-	return models, nil
 }
 
 func (c *modelCatalog) fetch(ctx context.Context, apiKey string, claude bool) (map[string]struct{}, error) {

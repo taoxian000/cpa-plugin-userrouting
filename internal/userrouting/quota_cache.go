@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -120,7 +121,23 @@ func (c *quotaReadCache) get(ctx context.Context, key quotaCacheKey, ttl time.Du
 	c.mu.Unlock()
 
 	startedAt := time.Now()
+	completed := false
+	defer func() {
+		// A panicking load must still release the flight; otherwise every later
+		// read of this key would wait on it forever.
+		if !completed {
+			c.finish(key, flight, quotaCacheValue{}, false, errQuotaLoadAborted, startedAt, ttl)
+		}
+	}()
 	value, cacheable, err := load()
+	completed = true
+	c.finish(key, flight, value, cacheable, err, startedAt, ttl)
+	return value, err
+}
+
+var errQuotaLoadAborted = errors.New("quota read aborted")
+
+func (c *quotaReadCache) finish(key quotaCacheKey, flight *quotaCacheFlight, value quotaCacheValue, cacheable bool, err error, startedAt time.Time, ttl time.Duration) {
 	c.mu.Lock()
 	flight.value, flight.err = value, err
 	if c.inFlight[key] == flight {
@@ -150,7 +167,6 @@ func (c *quotaReadCache) get(ctx context.Context, key quotaCacheKey, ttl time.Du
 	}
 	close(flight.done)
 	c.mu.Unlock()
-	return value, err
 }
 
 // An exhausted Codex window can recover before the configured cache TTL.

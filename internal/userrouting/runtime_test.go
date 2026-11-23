@@ -565,6 +565,7 @@ func (h *quotaFallbackHost) Call(method string, payload any) (json.RawMessage, e
 type streamQuotaFallbackHost struct {
 	mu         sync.Mutex
 	models     []string
+	paths      []string
 	emitted    []byte
 	firstError string
 }
@@ -578,12 +579,14 @@ func (h *streamQuotaFallbackHost) Call(method string, payload any) (json.RawMess
 		}
 		var request struct {
 			Model string `json:"model"`
+			Path  string `json:"path"`
 		}
 		if err := json.Unmarshal(raw, &request); err != nil {
 			return nil, err
 		}
 		h.mu.Lock()
 		h.models = append(h.models, request.Model)
+		h.paths = append(h.paths, request.Path)
 		attempt := len(h.models)
 		h.mu.Unlock()
 		if attempt == 1 {

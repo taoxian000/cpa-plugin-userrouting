@@ -106,6 +106,7 @@ type quotaFallbackConfig struct {
 	Enabled               bool                `yaml:"enabled"`
 	FallbackOnOtherErrors bool                `yaml:"fallback_on_other_errors"`
 	Prefixes              map[string][]string `yaml:"prefixes"`
+	AutoSort              autoSortConfig      `yaml:"auto_sort"`
 }
 
 type runtimeConfig struct {
@@ -115,6 +116,7 @@ type runtimeConfig struct {
 	HidePrefixedModels          bool
 	IncludeDefaultPrefix        bool
 	QuotaFallback               quotaFallbackConfig
+	AutoSort                    autoSortSettings
 	QuotaProvider               quotaProviderConfig
 	QuotaCacheTTL               time.Duration
 	StrictKeyValidation         bool
@@ -158,6 +160,10 @@ func decodeRuntimeConfig(raw []byte, opts ConfigureOptions) (runtimeConfig, erro
 		cfg.PrefixMap["default"] = ""
 	}
 	quotaFallback, err := normalizeQuotaFallback(cfg.QuotaFallback)
+	if err != nil {
+		return runtimeConfig{}, err
+	}
+	autoSort, err := normalizeAutoSort(cfg.QuotaFallback.AutoSort)
 	if err != nil {
 		return runtimeConfig{}, err
 	}
@@ -210,6 +216,7 @@ func decodeRuntimeConfig(raw []byte, opts ConfigureOptions) (runtimeConfig, erro
 		HidePrefixedModels:          cfg.HidePrefixedModels,
 		IncludeDefaultPrefix:        cfg.IncludeDefaultPrefix,
 		QuotaFallback:               quotaFallback,
+		AutoSort:                    autoSort,
 		QuotaProvider:               cfg.QuotaProvider,
 		QuotaCacheTTL:               quotaCacheTTL,
 		StrictKeyValidation:         cfg.StrictKeyValidation,
@@ -463,9 +470,9 @@ func validateMappedKeys(prefixes PrefixMap, keys map[string]struct{}) error {
 }
 
 func deriveModelsURL(snapshot CPAConfigSnapshot) (string, error) {
-	host := strings.TrimSpace(snapshot.Host)
+	host := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(snapshot.Host), "["), "]")
 	switch host {
-	case "", "0.0.0.0", "::", "[::]":
+	case "", "0.0.0.0", "::":
 		host = "127.0.0.1"
 	}
 	port := snapshot.Port

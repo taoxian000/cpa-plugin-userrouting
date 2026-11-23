@@ -58,6 +58,7 @@ static void free_host_buffer(void* ptr, size_t len) {
 import "C"
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -131,9 +132,18 @@ type registrationCapability struct {
 type hostCaller struct{}
 
 type envelope struct {
-	OK     bool             `json:"ok"`
-	Result json.RawMessage  `json:"result,omitempty"`
-	Error  *pluginabi.Error `json:"error,omitempty"`
+	OK     bool            `json:"ok"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *rpcError       `json:"error,omitempty"`
+}
+
+// rpcError mirrors pluginabi.Error including retry_after_seconds, which the
+// pinned SDK version does not declare.
+type rpcError struct {
+	Code              string `json:"code"`
+	Message           string `json:"message"`
+	HTTPStatus        int    `json:"http_status,omitempty"`
+	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
 }
 
 var currentRuntime atomic.Pointer[userrouting.Runtime]
@@ -154,18 +164,30 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 }
 
 //export cliproxyPluginCall
-func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
+func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) (code C.int) {
 	if response != nil {
 		response.ptr = nil
 		response.len = 0
 	}
+	// A panic unwinding out of a cgo export aborts the whole CPA process.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if response != nil && response.ptr != nil {
+				C.free(response.ptr)
+				response.ptr = nil
+				response.len = 0
+			}
+			writeResponse(response, errorEnvelope("plugin_panic", fmt.Sprintf("plugin panic: %v", recovered), http.StatusInternalServerError))
+			code = 1
+		}
+	}()
 	if method == nil {
 		writeResponse(response, errorEnvelope("invalid_method", "method is required", http.StatusBadRequest))
 		return 1
 	}
 	var requestBytes []byte
 	if request != nil && requestLen > 0 {
-		requestBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
+		requestBytes = copyCBuffer(unsafe.Pointer(request), requestLen)
 	}
 	raw, err := handleMethod(C.GoString(method), requestBytes)
 	if err != nil {
@@ -185,7 +207,9 @@ func cliproxyPluginFree(ptr unsafe.Pointer, _ C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
-	currentRuntime.Store(nil)
+	if previous := currentRuntime.Swap(nil); previous != nil {
+		previous.Close()
+	}
 }
 
 func handleMethod(method string, request []byte) ([]byte, error) {
@@ -208,7 +232,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		currentRuntime.Store(runtime)
+		if previous := currentRuntime.Swap(runtime); previous != nil {
+			previous.Close()
+		}
+		runtime.Start()
 		return okEnvelope(pluginRegistration(runtime))
 	case pluginabi.MethodModelRegister:
 		runtime, err := loadedRuntime()
@@ -348,7 +375,7 @@ func executeStream(request []byte) ([]byte, error) {
 		}()
 		err := runtime.RunStream(context.Background(), req.ExecutorRequest, req.HostCallbackID, streamID)
 		if err != nil {
-			closePluginStream(streamID, err.Error())
+			closePluginStreamWithError(streamID, err)
 			return
 		}
 		closePluginStream(streamID, "")
@@ -365,6 +392,20 @@ func closePluginStream(streamID, message string) {
 	})
 }
 
+func closePluginStreamWithError(streamID string, err error) {
+	status, retryAfter := userrouting.ErrorStatus(err)
+	_, _ = (hostCaller{}).Call(pluginabi.MethodHostStreamClose, map[string]any{
+		"stream_id": streamID,
+		"error":     strings.TrimSpace(err.Error()),
+		"error_detail": rpcError{
+			Code:              "plugin_error",
+			Message:           strings.TrimSpace(err.Error()),
+			HTTPStatus:        status,
+			RetryAfterSeconds: retryAfter,
+		},
+	})
+}
+
 func loadedRuntime() (*userrouting.Runtime, error) {
 	runtime := currentRuntime.Load()
 	if runtime == nil {
@@ -374,7 +415,7 @@ func loadedRuntime() (*userrouting.Runtime, error) {
 }
 
 func pluginRegistration(runtime *userrouting.Runtime) registration {
-	formats := []string{"openai", "openai-response", "claude", "gemini", "openai-video"}
+	formats := []string{"openai", "openai-response", "claude", "gemini", "openai-video", "openai-image"}
 	quotaEnabled, resourceEnabled := false, false
 	if runtime != nil {
 		quotaEnabled = runtime.QuotaProviderEnabled()
@@ -439,7 +480,7 @@ func (hostCaller) Call(method string, payload any) (json.RawMessage, error) {
 	callCode := C.call_host_api(cMethod, requestPtr, C.size_t(len(rawPayload)), &response)
 	var rawResponse []byte
 	if response.ptr != nil && response.len > 0 {
-		rawResponse = C.GoBytes(response.ptr, C.int(response.len))
+		rawResponse = copyCBuffer(response.ptr, response.len)
 	}
 	if response.ptr != nil {
 		C.free_host_buffer(response.ptr, response.len)
@@ -453,14 +494,29 @@ func (hostCaller) Call(method string, payload any) (json.RawMessage, error) {
 	}
 	if !env.OK {
 		if env.Error != nil {
-			return nil, fmt.Errorf("%s: %s", env.Error.Code, env.Error.Message)
+			return nil, &userrouting.HostCallError{
+				Code:              env.Error.Code,
+				Message:           env.Error.Message,
+				Status:            env.Error.HTTPStatus,
+				RetryAfterSeconds: env.Error.RetryAfterSeconds,
+			}
 		}
 		return nil, fmt.Errorf("host callback %s failed", method)
 	}
 	if callCode != 0 {
 		return nil, fmt.Errorf("host callback %s returned code=%d", method, int(callCode))
 	}
-	return append(json.RawMessage(nil), env.Result...), nil
+	// json.RawMessage decoding already copies, so env.Result owns its bytes.
+	return env.Result, nil
+}
+
+// copyCBuffer copies a C buffer into Go memory. C.GoBytes takes a C.int and
+// would truncate or panic for buffers of 2 GiB or more.
+func copyCBuffer(ptr unsafe.Pointer, length C.size_t) []byte {
+	if ptr == nil || length == 0 {
+		return nil
+	}
+	return bytes.Clone(unsafe.Slice((*byte)(ptr), int(length)))
 }
 
 func okEnvelope(value any) ([]byte, error) {
@@ -472,20 +528,22 @@ func okEnvelope(value any) ([]byte, error) {
 }
 
 func errorEnvelopeFor(err error) []byte {
-	status := http.StatusBadGateway
-	if statusErr, ok := err.(interface{ StatusCode() int }); ok {
-		status = statusErr.StatusCode()
-	}
-	return errorEnvelope("plugin_error", err.Error(), status)
+	status, retryAfter := userrouting.ErrorStatus(err)
+	return errorEnvelopeWithRetry("plugin_error", err.Error(), status, retryAfter)
 }
 
 func errorEnvelope(code, message string, status int) []byte {
+	return errorEnvelopeWithRetry(code, message, status, 0)
+}
+
+func errorEnvelopeWithRetry(code, message string, status, retryAfterSeconds int) []byte {
 	raw, _ := json.Marshal(envelope{
 		OK: false,
-		Error: &pluginabi.Error{
-			Code:       code,
-			Message:    message,
-			HTTPStatus: status,
+		Error: &rpcError{
+			Code:              code,
+			Message:           message,
+			HTTPStatus:        status,
+			RetryAfterSeconds: retryAfterSeconds,
 		},
 	})
 	return raw

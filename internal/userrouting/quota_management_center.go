@@ -253,7 +253,7 @@ func callManagementAPICall(ctx context.Context, snapshot CPAConfigSnapshot, mana
 			return managementUpstreamResponse{}, errors.New("CPA api-call response exceeded size limit")
 		}
 		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-			return managementUpstreamResponse{}, fmt.Errorf("CPA api-call endpoint returned HTTP %d", response.StatusCode)
+			return managementUpstreamResponse{}, quotaStatusError(fmt.Errorf("CPA api-call endpoint returned HTTP %d", response.StatusCode), response.StatusCode)
 		}
 		var envelope managementAPICallEnvelope
 		if err := json.Unmarshal(responseBody, &envelope); err != nil {
@@ -267,7 +267,9 @@ func callManagementAPICall(ctx context.Context, snapshot CPAConfigSnapshot, mana
 		if result.StatusCode == 0 {
 			return managementUpstreamResponse{}, errors.New("CPA api-call response omitted upstream status code")
 		}
-		if result.StatusCode < http.StatusOK || result.StatusCode >= http.StatusMultipleChoices {
+		// Match queryCPAManagementQuota: only rate limits and server errors are
+		// retried; other upstream statuses are returned for the caller to report.
+		if result.StatusCode == http.StatusTooManyRequests || result.StatusCode >= http.StatusInternalServerError {
 			return result, fmt.Errorf("upstream quota endpoint returned HTTP %d", result.StatusCode)
 		}
 		return result, nil

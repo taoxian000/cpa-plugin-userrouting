@@ -30,7 +30,7 @@ func (r *Runtime) handleAllKiroQuota(ctx context.Context, snapshot CPAConfigSnap
 		if provider == "" {
 			provider = strings.TrimSpace(entry.Type)
 		}
-		if strings.EqualFold(provider, "kiro") && !entry.Disabled && !entry.Unavailable && strings.TrimSpace(entry.AuthIndex) != "" {
+		if strings.EqualFold(provider, "kiro") && !entry.Disabled && strings.TrimSpace(entry.AuthIndex) != "" {
 			entries = append(entries, entry)
 		}
 	}

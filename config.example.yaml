@@ -38,6 +38,22 @@ plugins:
           prefix_1:
             - "prefix_2"
             - "prefix_3"
+        # Optional: order fallback targets by live Codex quota instead of the
+        # fixed lists above. Applies only when the nominal prefix is listed in
+        # auto_sort.prefixes; other prefixes keep their own list.
+        auto_sort:
+          enabled: false
+          # borrow: borrow without hurting account owners (default).
+          # weekly_urgency: spend weekly quota that expires soonest first.
+          strategy: "borrow"
+          # borrow only: owners whose 5-hour window is below this are treated
+          # as actively working. Accepts 25%, 25 or 0.25.
+          five_hour_reserve: "25%"
+          refresh_interval: "5m"
+          prefixes:
+            - "prefix_1"
+            - "prefix_2"
+            - "prefix_3"
 
       # Register the Codex QuotaProvider and expose public quota resources.
       # Normal queries require a downstream CPA API key, not a Management Key.

@@ -525,7 +525,15 @@ func (r *Runtime) HandleManagement(ctx context.Context, req pluginapi.Management
 			if cached.creditsIncomplete {
 				prefixResult.Errors = append(prefixResult.Errors, "one Codex reset-credit expiry query failed")
 			}
-			prefixResult.Accounts[account] = cached.account
+			accountKey := account
+			for suffix := 2; ; suffix++ {
+				if _, exists := prefixResult.Accounts[accountKey]; !exists {
+					break
+				}
+				prefixResult.Errors = appendOnce(prefixResult.Errors, "multiple Codex credentials share an email address")
+				accountKey = fmt.Sprintf("%s#%d", account, suffix)
+			}
+			prefixResult.Accounts[accountKey] = cached.account
 		}
 		selected := quotaPrefixHasRemaining(prefixResult)
 		if selected {
@@ -606,7 +614,7 @@ func (r *Runtime) handleQuotaByProviderEmail(ctx context.Context, provider, emai
 		if entryProvider == "" {
 			entryProvider = strings.TrimSpace(entry.Type)
 		}
-		if entry.Disabled || entry.Unavailable || !strings.EqualFold(entryProvider, provider) || strings.TrimSpace(entry.AuthIndex) == "" {
+		if entry.Disabled || !strings.EqualFold(entryProvider, provider) || strings.TrimSpace(entry.AuthIndex) == "" {
 			continue
 		}
 		if entry.Email != "" && !strings.EqualFold(strings.TrimSpace(entry.Email), email) {
@@ -926,7 +934,9 @@ func (r *Runtime) handleQuotaResetResource(ctx context.Context, nominalName stri
 	failed := 0
 	unresolved := 0
 	for _, entry := range files {
-		if entry.Disabled || entry.Unavailable || !strings.EqualFold(strings.TrimSpace(entry.Provider), quotaCodexProvider) {
+		// Cooling credentials are included: a reset is most useful exactly
+		// when CPA has marked the account unavailable after a quota error.
+		if entry.Disabled || !strings.EqualFold(strings.TrimSpace(entry.Provider), quotaCodexProvider) {
 			continue
 		}
 		rawAuth, err := r.getAuthJSON(entry.AuthIndex)
@@ -951,9 +961,12 @@ func (r *Runtime) handleQuotaResetResource(ctx context.Context, nominalName stri
 			continue
 		}
 		accountKey := account
-		if _, exists := result.NominalAccounts[accountKey]; exists {
-			accountKey = fmt.Sprintf("%s#%d", account, matched)
-			result.Errors = append(result.Errors, "multiple matching Codex credentials share an email address")
+		for suffix := 2; ; suffix++ {
+			if _, exists := result.NominalAccounts[accountKey]; !exists {
+				break
+			}
+			result.Errors = appendOnce(result.Errors, "multiple matching Codex credentials share an email address")
+			accountKey = fmt.Sprintf("%s#%d", account, suffix)
 		}
 		reset := r.ResetQuota(ctx, pluginapi.QuotaResetRequest{
 			AuthIndex:   entry.AuthIndex,
@@ -1022,6 +1035,15 @@ func quotaPrefixHasRemaining(prefix quotaPrefixResult) bool {
 	return false
 }
 
+func appendOnce(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
 func quotaJSONResponse(status int, value any) pluginapi.ManagementResponse {
 	body, err := json.Marshal(value)
 	if err != nil {
@@ -1046,6 +1068,12 @@ func (r *Runtime) quotaFallbackPrefixes(nominal string) []string {
 		result = append(result, prefix)
 	}
 	add(nominal)
+	if r.autoSortActive() && r.autoSort.isMember(normalizePrefixName(nominal)) {
+		for _, target := range r.autoSort.order(nominal) {
+			add(target)
+		}
+		return result
+	}
 	if r != nil && r.config.QuotaFallback.Enabled {
 		for _, target := range r.config.QuotaFallback.Prefixes[normalizePrefixName(nominal)] {
 			add(target)
@@ -1181,9 +1209,25 @@ func fetchCodexQuotaOnce(ctx context.Context, req pluginapi.QuotaFetchRequest) (
 		return pluginapi.QuotaFetchResponse{}, err
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return pluginapi.QuotaFetchResponse{}, fmt.Errorf("Codex quota endpoint returned HTTP %d", response.StatusCode)
+		return pluginapi.QuotaFetchResponse{}, quotaStatusError(fmt.Errorf("Codex quota endpoint returned HTTP %d", response.StatusCode), response.StatusCode)
 	}
 	return parseCodexQuotaResponse(response.Body)
+}
+
+// permanentQuotaError stops retryQuotaRead: repeating a request rejected with
+// a client error only multiplies upstream calls without changing the result.
+type permanentQuotaError struct{ err error }
+
+func (e *permanentQuotaError) Error() string { return e.err.Error() }
+func (e *permanentQuotaError) Unwrap() error { return e.err }
+
+// quotaStatusError marks err permanent unless status is a rate limit or a
+// server error.
+func quotaStatusError(err error, status int) error {
+	if status == http.StatusTooManyRequests || status >= http.StatusInternalServerError {
+		return err
+	}
+	return &permanentQuotaError{err: err}
 }
 
 func retryQuotaRead[T any](ctx context.Context, query func() (T, error)) (T, error) {
@@ -1198,7 +1242,8 @@ func retryQuotaRead[T any](ctx context.Context, query func() (T, error)) (T, err
 			return result, nil
 		}
 		lastErr = err
-		if attempt == quotaQueryRetryCount {
+		var permanent *permanentQuotaError
+		if attempt == quotaQueryRetryCount || errors.As(err, &permanent) {
 			break
 		}
 		timer := time.NewTimer(quotaQueryRetryDelay * time.Duration(1<<attempt))
@@ -1348,7 +1393,7 @@ func readCodexResetCreditsWithRetry(ctx context.Context, client quotaHTTPDoer, c
 			return readResult{}, err
 		}
 		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-			return readResult{}, fmt.Errorf("Codex reset-credit endpoint returned HTTP %d", response.StatusCode)
+			return readResult{}, quotaStatusError(fmt.Errorf("Codex reset-credit endpoint returned HTTP %d", response.StatusCode), response.StatusCode)
 		}
 		credits, err := parseCodexResetCredits(response.Body, fallbackCount)
 		if err != nil {
@@ -1418,10 +1463,14 @@ func firstAvailableCodexResetCreditID(raw []byte) string {
 func normalizeCodexExpiration(raw json.RawMessage) (string, bool) {
 	var text string
 	if json.Unmarshal(raw, &text) == nil {
-		if parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(text)); err == nil {
+		text = strings.TrimSpace(text)
+		if parsed, err := time.Parse(time.RFC3339Nano, text); err == nil {
 			return parsed.UTC().Format(time.RFC3339), true
 		}
-		return strings.TrimSpace(text), strings.TrimSpace(text) != ""
+		if seconds, err := strconv.ParseFloat(text, 64); err == nil {
+			return unixExpiration(seconds)
+		}
+		return text, text != ""
 	}
 	var value any
 	if json.Unmarshal(raw, &value) == nil {
@@ -1432,18 +1481,22 @@ func normalizeCodexExpiration(raw json.RawMessage) (string, bool) {
 		case json.Number:
 			parsed, parseErr := number.Float64()
 			seconds, ok = parsed, parseErr == nil
-		case string:
-			parsed, parseErr := strconv.ParseFloat(strings.TrimSpace(number), 64)
-			seconds, ok = parsed, parseErr == nil
 		}
-		if ok && seconds > 0 {
-			if seconds > 1_000_000_000_000 {
-				seconds /= 1000
-			}
-			return time.Unix(int64(seconds), 0).UTC().Format(time.RFC3339), true
+		if ok {
+			return unixExpiration(seconds)
 		}
 	}
 	return "", false
+}
+
+func unixExpiration(seconds float64) (string, bool) {
+	if seconds <= 0 {
+		return "", false
+	}
+	if seconds > 1_000_000_000_000 {
+		seconds /= 1000
+	}
+	return time.Unix(int64(seconds), 0).UTC().Format(time.RFC3339), true
 }
 
 func quotaResetCreditInfoFromQuota(quota pluginapi.QuotaFetchResponse) quotaResetCreditInfo {
